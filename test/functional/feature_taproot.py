@@ -1063,7 +1063,7 @@ def spenders_taproot_active():
         # n OP_CHECKSIGVERIFYs and 1 OP_CHECKSIGADD, but also one unexecuted OP_CHECKSIGVERIFY.
         lambda n, pk: (CScript([OP_DROP, pk, OP_0, OP_IF, OP_2DUP, OP_CHECKSIGVERIFY, OP_ENDIF] + [OP_2DUP, OP_CHECKSIGVERIFY] * n + [OP_2, OP_SWAP, OP_CHECKSIGADD, OP_3, OP_EQUAL]), n + 1),
         # n OP_CHECKSIGVERIFYs and 1 OP_CHECKSIGADD, but also one unexecuted OP_CHECKSIG.
-        lambda n, pk: (CScript([random.randbytes(220), OP_2DROP, pk, OP_1, OP_NOTIF, OP_2DUP, OP_CHECKSIG, OP_VERIFY, OP_ENDIF] + [OP_2DUP, OP_CHECKSIGVERIFY] * n + [OP_4, OP_SWAP, OP_CHECKSIGADD, OP_5, OP_EQUAL]), n + 1),
+        lambda n, pk: (CScript([random.randbytes(75), OP_2DROP, pk, OP_1, OP_NOTIF, OP_2DUP, OP_CHECKSIG, OP_VERIFY, OP_ENDIF] + [OP_2DUP, OP_CHECKSIGVERIFY] * n + [OP_4, OP_SWAP, OP_CHECKSIGADD, OP_5, OP_EQUAL]), n + 1),
         # n OP_CHECKSIGVERIFYs and 1 OP_CHECKSIGADD, but also one unexecuted OP_CHECKSIGADD.
         lambda n, pk: (CScript([OP_DROP, pk, OP_1, OP_IF, OP_ELSE, OP_2DUP, OP_6, OP_SWAP, OP_CHECKSIGADD, OP_7, OP_EQUALVERIFY, OP_ENDIF] + [OP_2DUP, OP_CHECKSIGVERIFY] * n + [OP_8, OP_SWAP, OP_CHECKSIGADD, OP_9, OP_EQUAL]), n + 1),
         # n+1 OP_CHECKSIGs, but also one OP_CHECKSIG with an empty signature.
