@@ -75,6 +75,9 @@ static constexpr int DNSSEEDS_TO_QUERY_AT_ONCE = 3;
 /** Minimum number of outbound connections under which we will keep fetching our address seeds. */
 static constexpr int SEED_OUTBOUND_CONNECTION_THRESHOLD = 2;
 
+/** How long to wait for fork-capable outbound peers before adding the fixed seeds for every reachable network. */
+static constexpr std::chrono::minutes FIXED_SEEDS_FORK_FALLBACK_DELAY{2};
+
 /** How long to delay before querying DNS seeds
  *
  * If we have more than THRESHOLD entries in addrman, then it's likely
@@ -2710,6 +2713,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
     auto next_extra_network_peer{start + rng.rand_exp_duration(EXTRA_NETWORK_PEER_INTERVAL)};
     const bool dnsseed = gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED);
     bool add_fixed_seeds = gArgs.GetBoolArg("-fixedseeds", DEFAULT_FIXEDSEEDS);
+    bool add_fixed_seeds_fork_fallback{add_fixed_seeds};
     const bool use_seednodes{!gArgs.GetArgs("-seednode").empty()};
 
     auto seed_node_timer = NodeClock::now();
@@ -2784,6 +2788,27 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
                 add_fixed_seeds = false;
                 LogPrintf("Added %d fixed seeds from reachable networks.\n", seed_addrs.size());
             }
+        }
+
+        // The fixed seeds above are only loaded for a network with no addresses at all. An addrman
+        // kept from before the BLAKE2b hard fork can be full of peers that cannot serve the chain past
+        // it, and where the DNS seeds do not help (-onlynet without IPv4 and IPv6, or no answer)
+        // nothing replaces them. The fixed seeds are fork-capable nodes, so if fewer than
+        // SEED_OUTBOUND_CONNECTION_THRESHOLD fork-capable full outbound peers have been found after
+        // FIXED_SEEDS_FORK_FALLBACK_DELAY, add them for every reachable network, once.
+        if (add_fixed_seeds_fork_fallback &&
+            GetTime<std::chrono::seconds>() > start + FIXED_SEEDS_FORK_FALLBACK_DELAY &&
+            GetFullOutboundConnCount() < SEED_OUTBOUND_CONNECTION_THRESHOLD) {
+            std::vector<CAddress> seed_addrs{ConvertSeeds(m_params.FixedSeeds())};
+            seed_addrs.erase(std::remove_if(seed_addrs.begin(), seed_addrs.end(),
+                                            [](const CAddress& addr) { return !g_reachable_nets.Contains(addr); }),
+                             seed_addrs.end());
+            CNetAddr local;
+            local.SetInternal("fixedseeds");
+            addrman.Add(seed_addrs, local);
+            add_fixed_seeds_fork_fallback = false;
+            LogPrintf("Added %d fixed seeds from reachable networks as fewer than %d fork-capable outbound peers were found\n",
+                      seed_addrs.size(), SEED_OUTBOUND_CONNECTION_THRESHOLD);
         }
 
         //
