@@ -817,6 +817,8 @@ private:
     }
 };
 
+unsigned int PolicyScriptVerifyFlags(const ignore_rejects_type& ignore_rejects);
+
 bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
 {
     AssertLockHeld(cs_main);
@@ -968,7 +970,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     if (m_pool.m_opts.datacarrier_fullcount || !m_pool.m_opts.accept_non_std_datacarrier) {
-        const auto dcb = DatacarrierBytes(tx, m_view);
+        const auto dcb = DatacarrierBytes(tx, m_view, PolicyScriptVerifyFlags(args.m_ignore_rejects));
         if (dcb.second > 0 && !(m_pool.m_opts.accept_non_std_datacarrier || ignore_rejects.count("txn-datacarrier-nonstandard"))) {
             return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "txn-datacarrier-nonstandard");
         }
@@ -1001,7 +1003,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // Set entry_sequence to 0 when rejectmsg_zero_mempool_entry_seq is used; this allows txs from a block
     // reorg to be marked earlier than any child txs that were already in the mempool.
     const uint64_t entry_sequence = args.m_ignore_rejects.count(rejectmsg_zero_mempool_entry_seq) ? 0 : m_pool.GetSequence();
-    int32_t extra_weight = CalculateExtraTxWeight(*ptx, m_view, ::g_weight_per_data_byte);
+    int32_t extra_weight = CalculateExtraTxWeight(*ptx, m_view, ::g_weight_per_data_byte, PolicyScriptVerifyFlags(args.m_ignore_rejects));
     if (!m_subpackage.m_changeset) {
         m_subpackage.m_changeset = m_pool.GetChangeSet();
     }

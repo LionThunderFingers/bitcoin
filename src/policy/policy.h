@@ -208,8 +208,9 @@ static inline int64_t GetVirtualTransactionInputSize(const CTxIn& tx)
 
 std::pair<CScript, unsigned int> GetScriptForTransactionInput(CScript prevScript, const CTxIn&);
 
-std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view);
+/** script_flags are the flags the caller verifies scripts with; wide multisig is run under them to see which signatures verify. */
+std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view, unsigned int script_flags = STANDARD_SCRIPT_VERIFY_FLAGS);
 
-int32_t CalculateExtraTxWeight(const CTransaction& tx, const CCoinsViewCache& view, const unsigned int weight_per_data_byte);
+int32_t CalculateExtraTxWeight(const CTransaction& tx, const CCoinsViewCache& view, const unsigned int weight_per_data_byte, unsigned int script_flags = STANDARD_SCRIPT_VERIFY_FLAGS);
 
 #endif // BITCOIN_POLICY_POLICY_H

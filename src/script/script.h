@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -577,7 +578,12 @@ public:
 
     size_t OPNetWitnessSize(const CScriptWitness& witness) const;
     size_t IsOLGA(size_t remaining_outputs) const;
-    std::pair<size_t, size_t> DatacarrierBytes(size_t remaining_outputs, const CScriptWitness* witness = nullptr) const;
+    /**
+     * verified_signatures, when given, is the number of signatures the spend was seen to verify. It
+     * then caps the signatures a script may claim instead of the witness items shaped like them.
+     */
+    std::pair<size_t, size_t> DatacarrierBytes(size_t remaining_outputs, const CScriptWitness* witness = nullptr,
+                                               std::optional<size_t> verified_signatures = std::nullopt) const;
 
     void clear()
     {

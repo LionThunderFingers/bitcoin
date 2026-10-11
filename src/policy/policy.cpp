@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -433,14 +434,78 @@ std::pair<CScript, unsigned int> GetScriptForTransactionInput(CScript prevScript
     return std::make_pair(CScript(), 0);
 }
 
-std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view)
+namespace {
+/** A signature checker that also counts the signatures that verify. */
+class CountingSignatureChecker final : public GenericTransactionSignatureChecker<CTransaction>
+{
+public:
+    using GenericTransactionSignatureChecker<CTransaction>::GenericTransactionSignatureChecker;
+    mutable size_t m_verified{0};
+
+    bool CheckECDSASignature(const std::vector<unsigned char>& sig, const std::vector<unsigned char>& pubkey,
+                             const CScript& script_code, SigVersion sigversion) const override
+    {
+        const bool ok{GenericTransactionSignatureChecker::CheckECDSASignature(sig, pubkey, script_code, sigversion)};
+        if (ok) ++m_verified;
+        return ok;
+    }
+
+    bool CheckSchnorrSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, SigVersion sigversion,
+                               ScriptExecutionData& execdata, ScriptError* serror) const override
+    {
+        const bool ok{GenericTransactionSignatureChecker::CheckSchnorrSignature(sig, pubkey, sigversion, execdata, serror)};
+        if (ok) ++m_verified;
+        return ok;
+    }
+};
+
+/**
+ * Datacarrier bytes of one input, with the signatures its script may claim capped by the ones the
+ * spend verifies. A checksig in a branch that never runs, or a witness item that is only the size of
+ * a signature, proves nothing.
+ *
+ * Running the spend is only worth it where the count matters: if the script stays within the
+ * unproven key tolerance with no signature credited at all, no count can change the result. That
+ * leaves wide multisig, which ordinary wallets rarely spend.
+ */
+std::pair<size_t, size_t> InputDatacarrierBytes(const CTransaction& tx, const unsigned int n_in, const CScript& script,
+                                                const CCoinsViewCache& view, std::optional<PrecomputedTransactionData>& txdata,
+                                                const unsigned int script_flags)
+{
+    const CTxIn& txin{tx.vin[n_in]};
+    if (txin.scriptWitness.stack.empty() || script.DatacarrierBytes(0, &txin.scriptWitness, /*verified_signatures=*/0).first == 0) {
+        return script.DatacarrierBytes(0, &txin.scriptWitness);
+    }
+    if (!txdata) {
+        std::vector<CTxOut> spent_outputs;
+        spent_outputs.reserve(tx.vin.size());
+        for (const CTxIn& in : tx.vin) spent_outputs.push_back(view.AccessCoin(in.prevout).out);
+        txdata.emplace();
+        txdata->Init(tx, std::move(spent_outputs));
+    }
+    const CTxOut& utxo{view.AccessCoin(txin.prevout).out};
+    const CountingSignatureChecker checker{&tx, n_in, utxo.nValue, *txdata, MissingDataBehavior::FAIL};
+    // The caller's flags are the ones the mempool verifies scripts with, so the signatures counted
+    // here are the ones it accepts. A spend that does not verify under them proves nothing: it is
+    // rejected by the script checks anyway, and crediting it any signature would only help a spend
+    // built to fail here and pass there.
+    if (!VerifyScript(txin.scriptSig, utxo.scriptPubKey, &txin.scriptWitness, script_flags, checker)) {
+        return script.DatacarrierBytes(0, &txin.scriptWitness, /*verified_signatures=*/0);
+    }
+    return script.DatacarrierBytes(0, &txin.scriptWitness, checker.m_verified);
+}
+} // namespace
+
+std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view, const unsigned int script_flags)
 {
     std::pair<size_t, size_t> ret{0, 0};
+    std::optional<PrecomputedTransactionData> txdata;
 
-    for (const CTxIn& txin : tx.vin) {
+    for (unsigned int i{0}; i < tx.vin.size(); ++i) {
+        const CTxIn& txin{tx.vin[i]};
         const CTxOut &utxo = view.AccessCoin(txin.prevout).out;
         auto[script, consensus_weight_per_byte] = GetScriptForTransactionInput(utxo.scriptPubKey, txin);
-        const auto dcb = script.DatacarrierBytes(0, &txin.scriptWitness);
+        const auto dcb = InputDatacarrierBytes(tx, i, script, view, txdata, script_flags);
         ret.first += dcb.first;
         ret.second += dcb.second;
     }
@@ -454,17 +519,19 @@ std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsV
     return ret;
 }
 
-int32_t CalculateExtraTxWeight(const CTransaction& tx, const CCoinsViewCache& view, const unsigned int weight_per_data_byte)
+int32_t CalculateExtraTxWeight(const CTransaction& tx, const CCoinsViewCache& view, const unsigned int weight_per_data_byte, const unsigned int script_flags)
 {
     int64_t mod_weight{0};
 
     // Add in any extra weight for data bytes
     if (weight_per_data_byte > 1) {
-        for (const CTxIn& txin : tx.vin) {
+        std::optional<PrecomputedTransactionData> txdata;
+        for (unsigned int i{0}; i < tx.vin.size(); ++i) {
+            const CTxIn& txin{tx.vin[i]};
             const CTxOut &utxo = view.AccessCoin(txin.prevout).out;
             auto[script, consensus_weight_per_byte] = GetScriptForTransactionInput(utxo.scriptPubKey, txin);
             if (weight_per_data_byte > consensus_weight_per_byte) {
-                const auto dcb = script.DatacarrierBytes(0, &txin.scriptWitness);
+                const auto dcb = InputDatacarrierBytes(tx, i, script, view, txdata, script_flags);
                 mod_weight += int64_t(dcb.first + dcb.second) * (weight_per_data_byte - consensus_weight_per_byte);
             }
         }

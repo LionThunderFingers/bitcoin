@@ -442,7 +442,8 @@ static size_t CountWitnessSignatures(const CScriptWitness& witness)
  * secp256k1 points, each carrying 31 bytes and hiding behind a hash until it is spent. Ordinary
  * multisig carries a couple of such keys itself, hence the tolerance.
  */
-static size_t UnprovenPubkeyBytes(const CScript& script, const CScriptWitness* witness)
+static size_t UnprovenPubkeyBytes(const CScript& script, const CScriptWitness* witness,
+                                  const std::optional<size_t> verified_signatures)
 {
     /** Unproven pubkeys a script may carry before the rest are counted as data. Set so that ordinary
      *  multisig, including wide federations, is charged nothing at all: the budget is per
@@ -560,7 +561,13 @@ static size_t UnprovenPubkeyBytes(const CScript& script, const CScriptWitness* w
     // it off the end, it may be miscounted as a signature. That can only inflate the count this
     // rule caps against, never shrink it, so it can only undercharge, never overcharge: a
     // documented imprecision, not a bug.
-    if (witness && !witness->stack.empty()) {
+    //
+    // Neither count is proof on its own: a checksig in a branch that never runs is still counted
+    // above, and a witness item only has to be the size of a signature. Where the caller has run
+    // the spend and seen which signatures verify, that number is the cap instead.
+    if (verified_signatures) {
+        provable = std::min(provable, *verified_signatures);
+    } else if (witness && !witness->stack.empty()) {
         provable = std::min(provable, CountWitnessSignatures(*witness));
     }
 
@@ -570,7 +577,8 @@ static size_t UnprovenPubkeyBytes(const CScript& script, const CScriptWitness* w
     return (pubkeys - provable - MAX_UNPROVEN_PUBKEYS) * CPubKey::COMPRESSED_SIZE;
 }
 
-std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outputs, const CScriptWitness* witness) const
+std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outputs, const CScriptWitness* witness,
+                                                   const std::optional<size_t> verified_signatures) const
 {
     if (size_t olga_bytes = IsOLGA(remaining_outputs); olga_bytes) {
         return {0, olga_bytes};
@@ -628,7 +636,7 @@ std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outpu
             counted += it - data_began;
         }
     }
-    return {UnprovenPubkeyBytes(*this, witness), counted};
+    return {UnprovenPubkeyBytes(*this, witness, verified_signatures), counted};
 }
 
 bool GetScriptOp(CScriptBase::const_iterator& pc, CScriptBase::const_iterator end, opcodetype& opcodeRet, std::vector<unsigned char>* pvchRet)
