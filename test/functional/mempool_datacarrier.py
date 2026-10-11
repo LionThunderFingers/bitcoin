@@ -18,7 +18,10 @@ from test_framework.script import (
     OP_2DROP,
     OP_7,
     OP_CHECKMULTISIG,
+    OP_CHECKSIG,
     OP_DROP,
+    OP_ENDIF,
+    OP_NOTIF,
     OP_RETURN,
     SIGHASH_ALL,
     SegwitV0SignatureHash,
@@ -98,12 +101,16 @@ class DataCarrierTest(BitcoinTestFramework):
                                     self.wallet.sendrawtransaction, from_node=node, tx_hex=tx_hex)
 
     def test_unproven_pubkeys_transaction(self, node: TestNode, m: int, n: int, success: bool,
-                                          num_inputs: int = 1) -> None:
+                                          num_inputs: int = 1, decoys: int = 0) -> None:
         """Spend num_inputs m-of-n P2WSH multisig outputs, offering every signature each asks for.
 
         The n - m keys left over are ones no signature can prove, and past a small tolerance
         their bytes are payload rather than a spending condition. The tolerance is per script,
         so several wide multisig inputs in one transaction do add up.
+
+        decoys (even) dresses the spend up as if it proved more keys than it does: that many
+        OP_CHECKSIGs in a branch that never runs, and that many signature-sized witness items
+        of random bytes, which the script drops before the multisig.
         """
         keys = []
         for _ in range(n):
@@ -111,7 +118,10 @@ class DataCarrierTest(BitcoinTestFramework):
             key.generate(compressed=True)
             keys.append(key)
         # Above 16 a key count is a minimal push rather than an OP_N, which CScript handles.
-        script = CScript([m] + [k.get_pubkey().get_bytes() for k in keys] + [n, OP_CHECKMULTISIG])
+        multisig = [m] + [k.get_pubkey().get_bytes() for k in keys] + [n, OP_CHECKMULTISIG]
+        assert decoys % 2 == 0
+        prefix = [OP_1, OP_NOTIF] + [OP_CHECKSIG] * decoys + [OP_ENDIF] + [OP_2DROP] * (decoys // 2) if decoys else []
+        script = CScript(prefix + multisig)
         script_pubkey = script_to_p2wsh_script(script)
 
         funding_value = 100_000
@@ -128,7 +138,8 @@ class DataCarrierTest(BitcoinTestFramework):
             sighash = SegwitV0SignatureHash(script, spend_tx, i, SIGHASH_ALL, funding_value)
             sigs = [k.sign_ecdsa(sighash) + bytes([SIGHASH_ALL]) for k in keys[:m]]
             # The leading empty item is the CHECKMULTISIG dummy.
-            spend_tx.wit.vtxinwit[i].scriptWitness.stack = [b''] + sigs + [bytes(script)]
+            fake_sigs = [randbytes(72) for _ in range(decoys)]
+            spend_tx.wit.vtxinwit[i].scriptWitness.stack = [b''] + sigs + fake_sigs + [bytes(script)]
         tx_hex = spend_tx.serialize().hex()
 
         if success:
@@ -254,6 +265,11 @@ class DataCarrierTest(BitcoinTestFramework):
         self.log.info("Testing a multisig padded out with keys no signature can prove.")
         self.test_unproven_pubkeys_transaction(node=self.nodes[0], m=1, n=11, success=True)
         self.test_unproven_pubkeys_transaction(node=self.nodes[0], m=1, n=15, success=False)
+
+        self.log.info("Testing that a spend is credited only the signatures it verifies, not "
+                      "checksigs that never run or witness items shaped like signatures.")
+        self.test_unproven_pubkeys_transaction(node=self.nodes[0], m=1, n=15, success=False, decoys=14)
+        self.test_unproven_pubkeys_transaction(node=self.nodes[0], m=11, n=15, success=True, decoys=4)
 
         self.log.info("Testing that -datacarriersize governs the spare keys, and that multisig "
                       "with nothing to spare is unaffected by it.")
