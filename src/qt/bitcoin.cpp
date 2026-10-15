@@ -658,6 +658,16 @@ int GuiMain(int argc, char* argv[])
     }
 #endif // ENABLE_WALLET
 
+    // A bitcoin.conf at the default data directory may have been ignored because
+    // a different data directory is in use. Only the non-GUI handlers are
+    // connected to core signals at this point, so an InitWarning() would not be
+    // seen by a GUI user. Show the warning directly instead.
+    if (const auto warning{gArgs.GetIgnoredDefaultConfigWarning()}) {
+        QMessageBox messagebox(QMessageBox::Warning, CLIENT_NAME, QString::fromStdString(warning->translated), QMessageBox::Ok);
+        messagebox.setTextFormat(Qt::PlainText);
+        messagebox.exec();
+    }
+
     /// 9. Main GUI initialization
     // Install global event filter that makes sure that out-of-focus labels do not contain text cursor.
     app.installEventFilter(new GUIUtil::LabelOutOfFocusEventFilter(&app));

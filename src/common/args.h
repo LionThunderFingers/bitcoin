@@ -10,6 +10,7 @@
 #include <sync.h>
 #include <util/chaintype.h>
 #include <util/fs.h>
+#include <util/translation.h>
 
 #include <iosfwd>
 #include <list>
@@ -146,6 +147,7 @@ protected:
     bool m_accept_any_command GUARDED_BY(cs_args){true};
     std::list<SectionInfo> m_config_sections GUARDED_BY(cs_args);
     std::optional<fs::path> m_config_path GUARDED_BY(cs_args);
+    std::optional<bilingual_str> m_ignored_default_config_warning GUARDED_BY(cs_args);
     std::optional<fs::path> m_rwconf_path GUARDED_BY(cs_args);
     bool m_rwconf_had_prune_option{false};
     mutable fs::path m_cached_blocks_path GUARDED_BY(cs_args);
@@ -193,6 +195,12 @@ protected:
     void SetConfigFilePath(fs::path);
     fs::path GetRWConfigFilePath() const;
     [[nodiscard]] bool ReadConfigFiles(std::string& error, bool ignore_invalid_keys = false);
+
+    /**
+     * Return the warning issued by the last ReadConfigFiles() call if a config
+     * file at the default data directory was ignored, so the GUI can show it.
+     */
+    std::optional<bilingual_str> GetIgnoredDefaultConfigWarning() const;
 
     bool RWConfigHasPruneOption() const { return m_rwconf_had_prune_option; }
     void ModifyRWConfigFile(const std::map<std::string, std::string>& settings_to_change, bool also_settings_json = true);

@@ -14,6 +14,7 @@
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/string.h>
+#include <util/translation.h>
 
 #include <algorithm>
 #include <cassert>
@@ -125,6 +126,12 @@ bool ArgsManager::ReadConfigStream(std::istream& stream, const std::string& file
     return true;
 }
 
+std::optional<bilingual_str> ArgsManager::GetIgnoredDefaultConfigWarning() const
+{
+    LOCK(cs_args);
+    return m_ignored_default_config_warning;
+}
+
 bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
 {
     {
@@ -134,6 +141,7 @@ bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
         m_rwconf_had_prune_option = false;
         m_config_sections.clear();
         m_config_path = AbsPathForConfigVal(*this, GetPathArg("-conf", BITCOIN_CONF_FILENAME), /*net_specific=*/false);
+        m_ignored_default_config_warning.reset();
     }
 
     const auto conf_path{GetConfigFilePath()};
@@ -164,12 +172,15 @@ bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
             // not reported as a different data directory.
             std::error_code ec;
             if (fs::exists(fs::status(default_conf, ec)) && !fs::equivalent(conf_path, default_conf, ec)) {
-                LogWarning("Config file %s doesn't exist or cannot be read, but a config file "
-                           "exists at the default data directory (%s). It is being ignored "
-                           "because a different data directory is in use. Move or copy it to "
-                           "the current data directory, or use the -conf option to specify "
-                           "its location.",
-                           fs::PathToString(conf_path), fs::PathToString(default_conf));
+                const bilingual_str warning{strprintf(_("Config file %s doesn't exist or cannot be read, but a config file "
+                                                        "exists at the default data directory (%s). It is being ignored "
+                                                        "because a different data directory is in use. Move or copy it to "
+                                                        "the current data directory, or use the -conf option to specify "
+                                                        "its location."),
+                                                      fs::PathToString(conf_path), fs::PathToString(default_conf))};
+                LogWarning("%s", warning.original);
+                LOCK(cs_args);
+                m_ignored_default_config_warning = warning;
             }
         }
     }
