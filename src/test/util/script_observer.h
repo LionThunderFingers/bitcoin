@@ -61,6 +61,23 @@ public:
     }
 };
 
+/** Answers signature checks and lock time checks from a list, cycling, so that two runs over the same
+ *  script get the same answers. */
+class ListSignatureChecker : public BaseSignatureChecker
+{
+    const std::vector<bool>& m_answers;
+    mutable size_t m_pos{0};
+
+    bool Answer() const { return m_answers.empty() ? false : m_answers[m_pos++ % m_answers.size()]; }
+
+public:
+    explicit ListSignatureChecker(const std::vector<bool>& answers) : m_answers(answers) {}
+    bool CheckECDSASignature(const std::vector<unsigned char>&, const std::vector<unsigned char>&, const CScript&, SigVersion, SighashRules = SighashRules::LEGACY) const override { return Answer(); }
+    bool CheckSchnorrSignature(Span<const unsigned char>, Span<const unsigned char>, SigVersion, ScriptExecutionData&, ScriptError* = nullptr, SighashRules = SighashRules::LEGACY) const override { return Answer(); }
+    bool CheckLockTime(const CScriptNum&) const override { return Answer(); }
+    bool CheckSequence(const CScriptNum&) const override { return Answer(); }
+};
+
 /** Hands an observer to the interpreter and otherwise defers to the checker underneath. */
 class ObservedSignatureChecker : public DeferringSignatureChecker
 {

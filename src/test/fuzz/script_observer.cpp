@@ -14,22 +14,6 @@
 #include <vector>
 
 namespace {
-//! Answers signature checks from a list taken from the fuzz input, so that two runs agree.
-class ListChecker : public BaseSignatureChecker
-{
-    const std::vector<bool>& m_answers;
-    mutable size_t m_pos{0};
-
-    bool Answer() const { return m_answers.empty() ? false : m_answers[m_pos++ % m_answers.size()]; }
-
-public:
-    explicit ListChecker(const std::vector<bool>& answers) : m_answers(answers) {}
-    bool CheckECDSASignature(const std::vector<unsigned char>&, const std::vector<unsigned char>&, const CScript&, SigVersion, SighashRules = SighashRules::LEGACY) const override { return Answer(); }
-    bool CheckSchnorrSignature(Span<const unsigned char>, Span<const unsigned char>, SigVersion, ScriptExecutionData&, ScriptError* = nullptr, SighashRules = SighashRules::LEGACY) const override { return Answer(); }
-    bool CheckLockTime(const CScriptNum&) const override { return Answer(); }
-    bool CheckSequence(const CScriptNum&) const override { return Answer(); }
-};
-
 std::vector<std::vector<unsigned char>> ConsumeStack(FuzzedDataProvider& provider)
 {
     std::vector<std::vector<unsigned char>> stack;
@@ -65,13 +49,13 @@ FUZZ_TARGET(script_observer)
 
         auto plain_stack{initial};
         ScriptError plain_err;
-        const ListChecker plain_checker{answers};
+        const test::ListSignatureChecker plain_checker{answers};
         const bool plain_ok{EvalScript(plain_stack, script, flags, plain_checker, sigversion, plain_data, &plain_err)};
 
         auto observed_stack{initial};
         ScriptError observed_err;
         test::CountingScriptObserver observer;
-        const ListChecker inner_checker{answers};
+        const test::ListSignatureChecker inner_checker{answers};
         const test::ObservedSignatureChecker observed_checker{inner_checker, observer};
         const bool observed_ok{EvalScript(observed_stack, script, flags, observed_checker, sigversion, observed_data, &observed_err)};
 
@@ -90,12 +74,12 @@ FUZZ_TARGET(script_observer)
         witness.stack = ConsumeStack(provider);
 
         ScriptError plain_err;
-        const ListChecker plain_checker{answers};
+        const test::ListSignatureChecker plain_checker{answers};
         const bool plain_ok{VerifyScript(script_sig, script_pub_key, &witness, flags, plain_checker, &plain_err)};
 
         ScriptError observed_err;
         test::CountingScriptObserver observer;
-        const ListChecker inner_checker{answers};
+        const test::ListSignatureChecker inner_checker{answers};
         const test::ObservedSignatureChecker observed_checker{inner_checker, observer};
         const bool observed_ok{VerifyScript(script_sig, script_pub_key, &witness, flags, observed_checker, &observed_err)};
 

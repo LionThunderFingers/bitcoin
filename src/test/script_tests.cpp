@@ -22,6 +22,7 @@
 #include <streams.h>
 #include <test/util/json.h>
 #include <test/util/random.h>
+#include <policy/executed_data.h>
 #include <test/util/script_observer.h>
 #include <test/util/setup_common.h>
 #include <test/util/transaction_utils.h>
@@ -148,6 +149,19 @@ void DoTest(const CScript& scriptPubKey, const CScript& scriptSig, const CScript
         BOOST_CHECK_MESSAGE(VerifyScript(scriptSig, scriptPubKey, &scriptWitness, flags, observed_checker, &observed_err) == expect, "observed: " + message);
         BOOST_CHECK_MESSAGE(observed_err == err, "observed error differs: " + message);
         BOOST_CHECK_MESSAGE(observer.contract_ok, "observer call order: " + message);
+    }
+    // The shadow model of the executed data tracer agrees with the interpreter on every vector.
+    {
+        const MutableTransactionSignatureChecker inner_checker{&tx, 0, txCredit.vout[0].nValue, MissingDataBehavior::ASSERT_FAIL};
+        VerifiedKeys keys;
+        SigCheckLog log;
+        ExecutedDataTracer tracer{&log};
+        const KeyRecordingSignatureChecker recorder{inner_checker, keys, &log, &tracer};
+        ScriptError traced_err;
+        BOOST_CHECK_MESSAGE(VerifyScript(scriptSig, scriptPubKey, &scriptWitness, flags, recorder, &traced_err) == expect, "traced: " + message);
+        BOOST_CHECK_MESSAGE(traced_err == err, "traced error differs: " + message);
+        const auto ledger = tracer.Finish();
+        BOOST_CHECK_MESSAGE(!ledger.failed, "tracer: " + ledger.fail_reason + ": " + message);
     }
 
     // Verify that removing flags from a passing test or adding flags to a failing test does not change the result.

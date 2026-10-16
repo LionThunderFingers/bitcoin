@@ -43,6 +43,7 @@ add_executable(fuzz
   descriptor_parse.cpp
   deserialize.cpp
   eval_script.cpp
+  executed_data.cpp
   feefrac.cpp
   fee_rate.cpp
   feeratediagram.cpp

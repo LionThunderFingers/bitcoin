@@ -178,6 +178,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   netbase.cpp
   outputtype.cpp
   policy/coin_age_priority.cpp
+  policy/executed_data.cpp
   policy/feerate.cpp
   policy/policy.cpp
   pow.cpp
