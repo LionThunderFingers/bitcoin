@@ -22,6 +22,7 @@
 #include <streams.h>
 #include <test/util/json.h>
 #include <test/util/random.h>
+#include <test/util/script_observer.h>
 #include <test/util/setup_common.h>
 #include <test/util/transaction_utils.h>
 #include <util/fs.h>
@@ -137,6 +138,17 @@ void DoTest(const CScript& scriptPubKey, const CScript& scriptSig, const CScript
 #endif
     BOOST_CHECK_MESSAGE(VerifyScript(scriptSig, scriptPubKey, &scriptWitness, flags, MutableTransactionSignatureChecker(&tx, 0, txCredit.vout[0].nValue, MissingDataBehavior::ASSERT_FAIL), &err) == expect, message);
     BOOST_CHECK_MESSAGE(err == scriptError, FormatScriptError(err) + " where " + FormatScriptError((ScriptError_t)scriptError) + " expected: " + message);
+
+    // An observer must not change the outcome, and the interpreter must keep to the call order.
+    {
+        const MutableTransactionSignatureChecker inner_checker{&tx, 0, txCredit.vout[0].nValue, MissingDataBehavior::ASSERT_FAIL};
+        test::CountingScriptObserver observer;
+        const test::ObservedSignatureChecker observed_checker{inner_checker, observer};
+        ScriptError observed_err;
+        BOOST_CHECK_MESSAGE(VerifyScript(scriptSig, scriptPubKey, &scriptWitness, flags, observed_checker, &observed_err) == expect, "observed: " + message);
+        BOOST_CHECK_MESSAGE(observed_err == err, "observed error differs: " + message);
+        BOOST_CHECK_MESSAGE(observer.contract_ok, "observer call order: " + message);
+    }
 
     // Verify that removing flags from a passing test or adding flags to a failing test does not change the result.
     for (int i = 0; i < 16; ++i) {

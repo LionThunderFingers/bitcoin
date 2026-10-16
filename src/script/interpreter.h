@@ -343,9 +343,61 @@ public:
 template <class T>
 uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn, int32_t nHashType, const CAmount& amount, SigVersion sigversion, const PrecomputedTransactionData* cache = nullptr, SigHashCache* sighash_cache = nullptr);
 
+/** Which part of the spend an interpreter run belongs to. */
+enum class ScriptRunKind {
+    SCRIPTSIG,         //!< the scriptSig (a plain EvalScript call also reports this until told otherwise)
+    SCRIPTPUBKEY,      //!< the scriptPubKey of the output being spent
+    REDEEMSCRIPT,      //!< the P2SH redeemScript
+    WITNESS_V0_SCRIPT, //!< the P2WSH witnessScript
+    WITNESS_V0_KEYHASH,//!< the script implied by a P2WPKH program
+    TAPSCRIPT,         //!< a tapscript leaf
+};
+
+/**
+ * Read-only view of what the interpreter does, for policy code that wants to account for
+ * executed data. It never changes a result, an error or a stack, and the interpreter never
+ * reads anything back from it.
+ *
+ * It is reached through BaseSignatureChecker::GetObserver(), which returns nullptr for every
+ * checker except the one policy code builds in MemPoolAccept::PolicyScriptChecks. Consensus
+ * and block validation therefore never see an observer, and the cost there is one pointer
+ * test per opcode.
+ *
+ * The call order for one input is: SetRunKind (and the P2SH/key path notifications) around
+ * the VerifyScript steps; per EvalScript run BeginRun, then BeforeOp/AfterOp for every opcode
+ * that is executed or is flow control, then EndRun if the run succeeded. A run that fails
+ * simply stops, so AfterOp is never called for an opcode that raised an error.
+ */
+class ScriptObserver
+{
+public:
+    virtual ~ScriptObserver() = default;
+    /** The next EvalScript call (or witness run) is of this kind. */
+    virtual void SetRunKind(ScriptRunKind kind) {}
+    /** An interpreter run starts. stack is the stack it starts with. */
+    virtual void BeginRun(const CScript& script, SigVersion sigversion, unsigned int flags, const std::vector<std::vector<unsigned char>>& stack) {}
+    /** Before an opcode runs. start is its offset in the script, end the offset after it
+     *  (including any push data), push_data the value a push opcode pushes. exec is false for
+     *  flow control inside an untaken branch. Pre-state views of both stacks. */
+    virtual void BeforeOp(opcodetype opcode, size_t start, size_t end, const std::vector<unsigned char>& push_data, bool exec, const std::vector<std::vector<unsigned char>>& stack, const std::vector<std::vector<unsigned char>>& altstack) {}
+    /** After the same opcode succeeded. Post-state views of both stacks. */
+    virtual void AfterOp(const std::vector<std::vector<unsigned char>>& stack, const std::vector<std::vector<unsigned char>>& altstack) {}
+    /** The run finished without error; stack is its final stack. */
+    virtual void EndRun(const std::vector<std::vector<unsigned char>>& stack) {}
+    /** VerifyScript copied the stack after the scriptSig (P2SH). */
+    virtual void P2SHStackCopied() {}
+    /** VerifyScript restored that stack and popped the redeemScript. */
+    virtual void P2SHRedeemScriptPopped() {}
+    /** A taproot key path spend was verified; sig is the single witness item. */
+    virtual void TaprootKeyPathSpend(const std::vector<unsigned char>& sig) {}
+};
+
 class BaseSignatureChecker
 {
 public:
+    /** The observer for this execution, if any. Only policy code sets one up; see ScriptObserver. */
+    virtual ScriptObserver* GetObserver() const { return nullptr; }
+
     /** sighash_rules comes from SCRIPT_VERIFY_UNIFIED_SIGHASH at the call site, so the
      *  script flags are the only thing that decides which signature hash
      *  applies. Checkers must not carry their own copy of that decision. */
@@ -452,6 +504,10 @@ public:
     bool CheckSequence(const CScriptNum& nSequence) const override
     {
         return m_checker.CheckSequence(nSequence);
+    }
+    ScriptObserver* GetObserver() const override
+    {
+        return m_checker.GetObserver();
     }
 };
 

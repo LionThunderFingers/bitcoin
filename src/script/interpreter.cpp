@@ -452,10 +452,15 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
 
     const unsigned int max_element_size = (flags & SCRIPT_VERIFY_REDUCED_ELEMENT_SIZE) ? MAX_SCRIPT_ELEMENT_SIZE_REDUCED : MAX_SCRIPT_ELEMENT_SIZE;
 
+    // Null in consensus and block validation: only policy code hands out a checker with an observer.
+    ScriptObserver* const observer{checker.GetObserver()};
+    if (observer) observer->BeginRun(script, sigversion, flags, stack);
+
     try
     {
         for (; pc < pend; ++opcode_pos) {
             bool fExec = vfExec.all_true();
+            const size_t op_start = static_cast<size_t>(pc - script.begin());
 
             //
             // Read instruction
@@ -492,6 +497,9 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
             // With SCRIPT_VERIFY_CONST_SCRIPTCODE, OP_CODESEPARATOR in non-segwit script is rejected even in an unexecuted branch
             if (opcode == OP_CODESEPARATOR && sigversion == SigVersion::BASE && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
                 return set_error(serror, SCRIPT_ERR_OP_CODESEPARATOR);
+
+            const bool observed{observer && (fExec || (OP_IF <= opcode && opcode <= OP_ENDIF))};
+            if (observed) observer->BeforeOp(opcode, op_start, static_cast<size_t>(pc - script.begin()), vchPushValue, fExec, stack, altstack);
 
             if (fExec && 0 <= opcode && opcode <= OP_PUSHDATA4) {
                 if (fRequireMinimal && !CheckMinimalPush(vchPushValue, opcode)) {
@@ -1240,6 +1248,8 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
             }
 
+            if (observed) observer->AfterOp(stack, altstack);
+
             // Size limits
             if (stack.size() + altstack.size() > MAX_STACK_SIZE)
                 return set_error(serror, SCRIPT_ERR_STACK_SIZE);
@@ -1252,6 +1262,8 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
 
     if (!vfExec.empty())
         return set_error(serror, SCRIPT_ERR_UNBALANCED_CONDITIONAL);
+
+    if (observer) observer->EndRun(stack);
 
     return set_success(serror);
 }
@@ -2022,7 +2034,7 @@ template bool SignatureHashUnified(uint256&, const CScript&, const CMutableTrans
 template class GenericTransactionSignatureChecker<CTransaction>;
 template class GenericTransactionSignatureChecker<CMutableTransaction>;
 
-static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CScript& exec_script, unsigned int flags, SigVersion sigversion, const BaseSignatureChecker& checker, ScriptExecutionData& execdata, ScriptError* serror)
+static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CScript& exec_script, unsigned int flags, SigVersion sigversion, ScriptRunKind run_kind, const BaseSignatureChecker& checker, ScriptExecutionData& execdata, ScriptError* serror)
 {
     std::vector<valtype> stack{stack_span.begin(), stack_span.end()};
 
@@ -2055,6 +2067,7 @@ static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CS
     }
 
     // Run the script interpreter.
+    if (ScriptObserver* observer = checker.GetObserver()) observer->SetRunKind(run_kind);
     if (!EvalScript(stack, exec_script, flags, checker, sigversion, execdata, serror)) return false;
 
     // Scripts inside witness implicitly require cleanstack behaviour
@@ -2127,14 +2140,14 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             if (memcmp(hash_exec_script.begin(), program.data(), 32)) {
                 return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
             }
-            return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::WITNESS_V0, checker, execdata, serror);
+            return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::WITNESS_V0, ScriptRunKind::WITNESS_V0_SCRIPT, checker, execdata, serror);
         } else if (program.size() == WITNESS_V0_KEYHASH_SIZE) {
             // BIP141 P2WPKH: 20-byte witness v0 program (which encodes Hash160(pubkey))
             if (stack.size() != 2) {
                 return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH); // 2 items in witness
             }
             exec_script << OP_DUP << OP_HASH160 << program << OP_EQUALVERIFY << OP_CHECKSIG;
-            return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::WITNESS_V0, checker, execdata, serror);
+            return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::WITNESS_V0, ScriptRunKind::WITNESS_V0_KEYHASH, checker, execdata, serror);
         } else {
             return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WRONG_LENGTH);
         }
@@ -2161,6 +2174,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             if (!checker.CheckSchnorrSignature(stack.front(), program, SigVersion::TAPROOT, execdata, serror, SighashRulesFromFlags(flags))) {
                 return false; // serror is set
             }
+            if (ScriptObserver* observer = checker.GetObserver()) observer->TaprootKeyPathSpend(stack.front());
             return set_success(serror);
         } else {
             // Script path spending (stack size is >1 after removing optional annex)
@@ -2180,7 +2194,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
                 exec_script = CScript(script.begin(), script.end());
                 execdata.m_validation_weight_left = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
                 execdata.m_validation_weight_left_init = true;
-                return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::TAPSCRIPT, checker, execdata, serror);
+                return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::TAPSCRIPT, ScriptRunKind::TAPSCRIPT, checker, execdata, serror);
             }
             if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) {
                 return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION);
@@ -2216,6 +2230,8 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
     // scriptSig and scriptPubKey must be evaluated sequentially on the same stack
     // rather than being simply concatenated (see CVE-2010-5141)
     std::vector<std::vector<unsigned char> > stack, stackCopy;
+    ScriptObserver* const observer{checker.GetObserver()};
+    if (observer) observer->SetRunKind(ScriptRunKind::SCRIPTSIG);
     if (scriptPubKey.IsPayToScriptHash()) {
         // Disable SCRIPT_VERIFY_REDUCED_ELEMENT_SIZE for pushing the P2SH redeemScript
         if (!EvalScript(stack, scriptSig, flags & ~SCRIPT_VERIFY_REDUCED_ELEMENT_SIZE, checker, SigVersion::BASE, serror))
@@ -2225,8 +2241,11 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
     if (!EvalScript(stack, scriptSig, flags, checker, SigVersion::BASE, serror))
         // serror is set
         return false;
-    if (flags & SCRIPT_VERIFY_P2SH)
+    if (flags & SCRIPT_VERIFY_P2SH) {
         stackCopy = stack;
+        if (observer) observer->P2SHStackCopied();
+    }
+    if (observer) observer->SetRunKind(ScriptRunKind::SCRIPTPUBKEY);
     if (!EvalScript(stack, scriptPubKey, flags, checker, SigVersion::BASE, serror))
         // serror is set
         return false;
@@ -2272,6 +2291,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
         const valtype& pubKeySerialized = stack.back();
         CScript pubKey2(pubKeySerialized.begin(), pubKeySerialized.end());
         popstack(stack);
+        if (observer) observer->P2SHRedeemScriptPopped();
 
         if (flags & SCRIPT_VERIFY_REDUCED_ELEMENT_SIZE) {
             // We bypassed the reduced data check above to exempt redeemScript
@@ -2282,6 +2302,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
             }
         }
 
+        if (observer) observer->SetRunKind(ScriptRunKind::REDEEMSCRIPT);
         if (!EvalScript(stack, pubKey2, flags, checker, SigVersion::BASE, serror))
             // serror is set
             return false;
