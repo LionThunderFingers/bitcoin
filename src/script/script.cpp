@@ -1142,7 +1142,7 @@ static size_t UnprovenPubkeyBytes(const CScript& script, const CScriptWitness* w
     return std::max(static_charge, verified_charge);
 }
 
-std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outputs, const CScriptWitness* witness, const bool dead_branches, const VerifiedKeys* verified_keys, bool* reached_normal_return) const
+std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outputs, const CScriptWitness* witness, const bool dead_branches, const VerifiedKeys* verified_keys, bool* reached_normal_return, DatacarrierRanges* ranges) const
 {
     // Cleared here and set just before the normal return, so every early return below leaves it false.
     if (reached_normal_return) *reached_normal_return = false;
@@ -1152,6 +1152,7 @@ std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outpu
 
     if (witness) {
         if (uint32_t opnet_bytes = OPNetWitnessSize(*witness); opnet_bytes) {
+            if (ranges) ranges->whole_input = true;
             return {0, opnet_bytes};
         }
     }
@@ -1170,16 +1171,21 @@ std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outpu
         opcode_it = it;
         if (!GetOp(it, opcode, push_data)) {
             // Invalid scripts are necessarily all data
+            if (ranges) ranges->counted = {{0, size()}};
             return {0, size()};
         }
 
         if (opcode == OP_IF || opcode == OP_NOTIF) {
             ++inside_conditional;
         } else if (opcode == OP_ENDIF) {
-            if (!inside_conditional) return {0, size()};  // invalid
+            if (!inside_conditional) {  // invalid
+                if (ranges) ranges->counted = {{0, size()}};
+                return {0, size()};
+            }
             --inside_conditional;
         } else if (opcode == OP_RETURN && !inside_conditional) {
             // unconditional OP_RETURN is unspendable
+            if (ranges) ranges->counted = {{0, size()}};
             return {size(), 0};
         }
 
@@ -1208,12 +1214,14 @@ std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outpu
             case OP_ELSE:
                 if (dead_branches && inside_noop == 1) {
                     counted += opcode_it - data_began + span_guard;
+                    if (ranges) ranges->counted.emplace_back(static_cast<size_t>(data_began - begin()), static_cast<size_t>(opcode_it - begin()));
                     inside_noop = 0;
                 }
                 break;
             case OP_ENDIF:
                 if (0 == --inside_noop) {
                     counted += it - data_began + span_guard;
+                    if (ranges) ranges->counted.emplace_back(static_cast<size_t>(data_began - begin()), static_cast<size_t>(it - begin()));
                 }
                 break;
             default: /* do nothing */;
@@ -1226,6 +1234,7 @@ std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outpu
             if (!is_push(last_opcode)) data_began = opcode_it;  // only reset at the start of a push run
         } else if ((opcode == OP_DROP || opcode == OP_2DROP) && is_push(last_opcode)) {
             counted += it - data_began;
+            if (ranges) ranges->counted.emplace_back(static_cast<size_t>(data_began - begin()), static_cast<size_t>(it - begin()));
         }
     }
     if (reached_normal_return) *reached_normal_return = true;

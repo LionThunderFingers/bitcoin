@@ -80,6 +80,8 @@ struct MemPoolOptions {
      */
     std::optional<unsigned> max_datacarrier_bytes{DEFAULT_ACCEPT_DATACARRIER ? std::optional{MAX_OP_RETURN_RELAY} : std::nullopt};
     bool datacarrier_fullcount{DEFAULT_DATACARRIER_FULLCOUNT};
+    //! Count what script execution did not use, on top of the static count. Needs datacarrier_fullcount.
+    bool datacarrier_executed{DEFAULT_DATACARRIER_EXECUTED};
     bool permitbaredatacarrier{DEFAULT_PERMITBAREDATACARRIER};
     bool permitbareanchor{DEFAULT_PERMITBAREANCHOR};
     bool permit_bare_pubkey{DEFAULT_PERMIT_BAREPUBKEY};

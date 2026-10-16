@@ -127,6 +127,8 @@ static const bool DEFAULT_PERMITBAREDATACARRIER{false};
 static const unsigned int MAX_OP_RETURN_RELAY = 83;
 /** Default for -datacarrierfullcount */
 static constexpr bool DEFAULT_DATACARRIER_FULLCOUNT{true};
+/** Default for -datacarrierexecuted */
+static constexpr bool DEFAULT_DATACARRIER_EXECUTED{true};
 /**
  * An extra transaction can be added to a package, as long as it only has one
  * ancestor and is no larger than this. Not really any reason to make this
@@ -257,15 +259,25 @@ struct DatacarrierInputCache {
     bool normal;    //!< the per-input script reached DatacarrierBytes's normal return (counted is meaningful)
 };
 
+struct InputTrace;
+
 /**
  * @param[in]  verified_keys  One set per input of the keys a signature verified against, from the policy
  *                            script check, or nullptr when none was observed. See CScript::DatacarrierBytes.
  * @param[in,out] input_cache With verified_keys == nullptr, filled with one entry per input (the static
  *                            count). With verified_keys set and a cache that matches the inputs, the
  *                            cached dead-branch count is reused and only the unproven-pubkey part is
- *                            recomputed, skipping the dead-branch scan. nullptr disables both.
+ *                            recomputed, skipping the dead-branch scan. nullptr disables both. Ignored
+ *                            (neither filled nor read) when traces is given: the executed-data accounting
+ *                            needs the full counting pass of every input, which is what emits its ranges.
+ * @param[in]  traces         One trace per input from the policy script check. When given, the second member
+ *                            also holds the executed-data accounting (see ExecutedDataBytes), and a vector of
+ *                            the wrong size, or an empty one, charges every input as not followed. nullptr
+ *                            leaves out the executed-data accounting altogether (the static count).
+ * @param[out] untraceable    Set if the model behind a trace failed for some input.
  */
-std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view, const std::vector<VerifiedKeys>* verified_keys = nullptr, std::vector<DatacarrierInputCache>* input_cache = nullptr);
+std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view, const std::vector<VerifiedKeys>* verified_keys = nullptr, std::vector<DatacarrierInputCache>* input_cache = nullptr,
+                                           const std::vector<InputTrace>* traces = nullptr, bool* untraceable = nullptr);
 
 int32_t CalculateExtraTxWeight(const CTransaction& tx, const CCoinsViewCache& view, const unsigned int weight_per_data_byte);
 

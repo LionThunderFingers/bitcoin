@@ -155,7 +155,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        std::vector<CScriptCheck>* pvChecks = nullptr,
                        const std::vector<unsigned int>& flags_per_input = {},
                        std::vector<VerifiedKeys>* verified_keys = nullptr,
-                       std::vector<SigCheckLog>* sig_check_logs = nullptr)
+                       std::vector<SigCheckLog>* sig_check_logs = nullptr,
+                       std::vector<InputTrace>* traces = nullptr)
                        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& tx)
@@ -731,14 +732,19 @@ private:
          * Reused across PolicyScriptChecks and ConsensusScriptChecks. */
         PrecomputedTransactionData m_precomputed_txdata;
         /** The keys a signature verified against, one set per input. Populated by PolicyScriptChecks only
-         * when the datacarrier recount runs (the `recount` gate below); otherwise left empty and the script
-         * execution cache is used as before. An input that verified no key has an empty set. */
+         * when a datacarrier recount runs: the keys-only recount (the `recount` gate below, which needs a
+         * witness) or the executed-data accounting (the `executed` gate, which also covers a transaction
+         * with no witness); otherwise left empty and the script execution cache is used as before. An
+         * input that verified no key has an empty set. */
         std::vector<VerifiedKeys> m_verified_keys;
         /** Per-input result of the pre-script static datacarrier count, so the post-script recount can
          *  reuse each input's dead-branch count and recompute only its unproven-pubkey part. */
         std::vector<DatacarrierInputCache> m_carrier_cache;
-        /** The signature checks of each input in the order they happened, sized like m_verified_keys. */
+        /** The signature checks of each input in the order they happened. Populated only for the
+         * executed-data accounting (the `executed` gate below), then sized like m_verified_keys. */
         std::vector<SigCheckLog> m_sig_check_logs;
+        /** What the executed-data tracer found for each input, sized like m_verified_keys. */
+        std::vector<InputTrace> m_traces;
     };
 
     static inline bool MaybeReject_(TxValidationResult reason, const std::string& reason_str, const std::string& debug_msg, const ignore_rejects_type& ignore_rejects, TxValidationState& state) {
@@ -1568,18 +1574,32 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     const unsigned int scriptVerifyFlags = PolicyScriptVerifyFlags(args.m_ignore_rejects) |
         UnifiedSighashMempoolFlag(m_active_chainstate.m_chainman);
 
-    // The datacarrier recount below runs only when -datacarrierfullcount is on, the limit is enforced,
-    // and the transaction has a witness: only a script taken from the witness is recounted, so without
-    // one the recount equals the count PreChecks already checked. Record the verified keys only then: a
-    // non-null set makes CheckInputScripts skip the script execution cache so every input is run, which
-    // is wasted work when no recount follows.
+    // Two things make the datacarrier code below run after the scripts, both only when
+    // -datacarrierfullcount is on and the limit is enforced.
+    // - The keys-only recount (recount): needs the transaction to have a witness. Only a script taken
+    //   from the witness is recounted from the verified keys, so without one the recount equals the
+    //   count PreChecks already checked.
+    // - The executed-data accounting (executed), with -datacarrierexecuted: charges the stack and code
+    //   bytes a spend did not use, for every input, so it does not need a witness (a legacy P2SH spend
+    //   can carry a dead branch too). It implies the recount, which it folds into one pass.
+    // Record the verified keys only when a recount follows, either of the two. A non-null set of verified
+    // keys is what keeps CheckInputScripts out of the script execution cache, so that every input is run,
+    // which is wasted work when nothing is recounted. The signature-check logs and the traces are recorded
+    // only for the executed-data accounting, which is the only thing that reads them. The traces are only
+    // ever requested together with the logs and the set of verified keys, so they need no cache handling
+    // of their own.
     const bool recount{m_pool.m_opts.datacarrier_fullcount &&
                        !args.m_ignore_rejects.count("txn-datacarrier-exceeded") &&
                        tx.HasWitness()};
+    const bool executed{m_pool.m_opts.datacarrier_fullcount && m_pool.m_opts.datacarrier_executed &&
+                        !args.m_ignore_rejects.count("txn-datacarrier-exceeded")};
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), nullptr, {}, recount ? &ws.m_verified_keys : nullptr, recount ? &ws.m_sig_check_logs : nullptr)) {
+    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), nullptr, {},
+                           (recount || executed) ? &ws.m_verified_keys : nullptr,
+                           executed ? &ws.m_sig_check_logs : nullptr,
+                           executed ? &ws.m_traces : nullptr)) {
         // Detect a failure due to a missing witness so that p2p code can handle rejection caching appropriately.
         if (!tx.HasWitness() && SpendsNonAnchorWitnessProg(tx, m_view)) {
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
@@ -1590,12 +1610,28 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 
     // PreChecks counted the unproven pubkeys of each input from the script alone, before any script ran,
     // and a signature-check opcode in code that never runs, or that runs and fails, fools that count.
-    // Now that the scripts have run, count again from the keys a signature really verified against.
+    // Now that the scripts have run, count again from what they did: the keys a signature really verified
+    // against, and which bytes of the stack sources and of the code the execution used.
     // The recount can only add to what PreChecks charged. datacarriercost pricing is not redone.
     // Recording keeps CheckInputScripts out of the script execution cache, so every input ran and has
-    // its set, and an input that verified no key is recounted with an empty one. Only a result without
-    // one set per input would be no observation, and the static count would stand.
-    if (recount && ws.m_verified_keys.size() == tx.vin.size()) {
+    // its set (and, with the executed-data accounting, its trace), and an input that verified no key is
+    // recounted with an empty one. Only a result without one set per input would be no observation, and
+    // the static count would stand.
+    // The two gates differ on purpose. The keys-only recount (#470) needs a witness. The executed-data
+    // accounting does not: it charges every input, including a legacy P2SH spend in a transaction
+    // without a witness, whose redeem script can carry a dead branch.
+    if (executed) {
+        const bool observed{ws.m_verified_keys.size() == tx.vin.size()};
+        bool untraceable{false};
+        const auto dcb = DatacarrierBytes(tx, m_view, observed ? &ws.m_verified_keys : nullptr, /*input_cache=*/nullptr, &ws.m_traces, &untraceable);
+        // A model that disagrees with the interpreter must not hide behind the ordinary reason.
+        if (untraceable && !args.m_ignore_rejects.count("txn-datacarrier-untraceable")) {
+            return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "txn-datacarrier-untraceable");
+        }
+        if (dcb.first + dcb.second > m_pool.m_opts.max_datacarrier_bytes.value_or(0)) {
+            return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "txn-datacarrier-exceeded");
+        }
+    } else if (recount && ws.m_verified_keys.size() == tx.vin.size()) {
         const auto dcb = DatacarrierBytes(tx, m_view, &ws.m_verified_keys, &ws.m_carrier_cache);
         if (dcb.first + dcb.second > m_pool.m_opts.max_datacarrier_bytes.value_or(0)) {
             return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "txn-datacarrier-exceeded");
@@ -2568,7 +2604,21 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
     bool verified;
     if (m_verified_keys) {
         // Wraps the caching checker, so a signature-cache hit is observed like any other success.
-        verified = VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, KeyRecordingSignatureChecker(checker, *m_verified_keys, m_sig_check_log), &error);
+        // The tracer watches the same execution that the recorder does, so nothing runs twice. An input
+        // that carries more than the tracer is willing to follow is left untraced and charged for that.
+        std::optional<ExecutedDataTracer> tracer;
+        if (m_trace && m_sig_check_log) {
+            if (TraceableInputBytes(ptxTo->vin[nIn]) > MAX_TRACED_INPUT_BYTES) {
+                m_trace->status = InputTrace::Status::TOO_LARGE;
+            } else {
+                tracer.emplace(m_sig_check_log);
+            }
+        }
+        verified = VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, KeyRecordingSignatureChecker(checker, *m_verified_keys, m_sig_check_log, tracer ? &*tracer : nullptr), &error);
+        if (tracer) {
+            m_trace->ledger = tracer->Finish();
+            m_trace->status = m_sig_check_log->overflow ? InputTrace::Status::LOG_OVERFLOW : InputTrace::Status::TRACED;
+        }
     } else {
         verified = VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, checker, &error);
     }
@@ -2621,7 +2671,8 @@ ValidationCache::ValidationCache(const size_t script_execution_cache_bytes, cons
  * is not consulted, so the scripts always run, and it is sized to one set per input, holding the public
  * keys a non-empty signature verified against. An input that verified no key gets an empty set. Storing
  * into the script execution cache is unchanged. It has no effect on the result.
- * sig_check_logs, if also given, is sized alike and holds each input's signature checks in order.
+ * sig_check_logs, if also given, is sized alike and holds each input's signature checks in order, and
+ * traces, if given as well, is sized alike and holds what the executed-data tracer made of each input.
  *
  * Non-static (and redeclared) in src/test/txvalidationcache_tests.cpp
  */
@@ -2632,11 +2683,13 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        std::vector<CScriptCheck>* pvChecks,
                        const std::vector<unsigned int>& flags_per_input,
                        std::vector<VerifiedKeys>* verified_keys,
-                       std::vector<SigCheckLog>* sig_check_logs)
+                       std::vector<SigCheckLog>* sig_check_logs,
+                       std::vector<InputTrace>* traces)
 {
     // Cleared first, so that nothing stale survives and a set exists only for an input that ran below.
     if (verified_keys) verified_keys->clear();
     if (sig_check_logs) sig_check_logs->clear();
+    if (traces) traces->clear();
 
     if (tx.IsCoinBase()) return true;
 
@@ -2681,6 +2734,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     // Block validation queues its checks, and never records.
     if (verified_keys && !pvChecks) verified_keys->resize(tx.vin.size());
     if (verified_keys && sig_check_logs && !pvChecks) sig_check_logs->resize(tx.vin.size());
+    if (verified_keys && sig_check_logs && traces && !pvChecks) traces->resize(tx.vin.size());
 
     for (unsigned int i = 0; i < tx.vin.size(); i++) {
         if (!flags_per_input.empty()) flags = flags_per_input[i];
@@ -2694,7 +2748,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         // Verify signature
         CScriptCheck check(txdata.m_spent_outputs[i], tx, validation_cache.m_signature_cache, i, flags, cacheSigStore, &txdata,
                            (verified_keys && !pvChecks) ? &(*verified_keys)[i] : nullptr,
-                           (verified_keys && sig_check_logs && !pvChecks) ? &(*sig_check_logs)[i] : nullptr);
+                           (verified_keys && sig_check_logs && !pvChecks) ? &(*sig_check_logs)[i] : nullptr,
+                           (verified_keys && sig_check_logs && traces && !pvChecks) ? &(*traces)[i] : nullptr);
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
         } else if (auto result = check(); result.has_value()) {

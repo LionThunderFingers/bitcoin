@@ -18,6 +18,7 @@
 #include <kernel/chainstatemanager_opts.h>
 #include <kernel/cs_main.h> // IWYU pragma: export
 #include <node/blockstorage.h>
+#include <policy/executed_data.h>
 #include <policy/feerate.h>
 #include <policy/packages.h>
 #include <policy/policy.h>
@@ -367,10 +368,12 @@ private:
     VerifiedKeys* m_verified_keys;
     /** Where to keep the ordered signature checks, or nullptr to keep none. Only used together with m_verified_keys. */
     SigCheckLog* m_sig_check_log;
+    /** Where to put what the executed-data tracer found, or nullptr to trace nothing. Needs m_sig_check_log. */
+    InputTrace* m_trace;
 
 public:
-    CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, SignatureCache& signature_cache, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn, PrecomputedTransactionData* txdataIn, VerifiedKeys* verified_keys = nullptr, SigCheckLog* sig_check_log = nullptr) :
-        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn), m_signature_cache(&signature_cache), m_verified_keys(verified_keys), m_sig_check_log(sig_check_log) { }
+    CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, SignatureCache& signature_cache, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn, PrecomputedTransactionData* txdataIn, VerifiedKeys* verified_keys = nullptr, SigCheckLog* sig_check_log = nullptr, InputTrace* trace = nullptr) :
+        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn), m_signature_cache(&signature_cache), m_verified_keys(verified_keys), m_sig_check_log(sig_check_log), m_trace(trace) { }
 
     CScriptCheck(const CScriptCheck&) = delete;
     CScriptCheck& operator=(const CScriptCheck&) = delete;

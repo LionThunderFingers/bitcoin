@@ -41,6 +41,17 @@ static constexpr unsigned int MAX_PUBKEYS_PER_MULTI_A = 999;
 /** The public keys a non-empty signature verified against while one input was executed. */
 using VerifiedKeys = std::set<std::vector<unsigned char>>;
 
+/**
+ * The bytes of a script that CScript::DatacarrierBytes counted as data in its second member, as
+ * [begin, end) ranges of the script. The executed-data accounting uses it to give every byte of an
+ * input exactly one role: a byte in a counted range is paid for by the static rule and by nothing else.
+ */
+struct DatacarrierRanges {
+    std::vector<std::pair<size_t, size_t>> counted;
+    //! The static rule owns the whole input (an OPNet witness), so nothing else may add to it.
+    bool whole_input{false};
+};
+
 // Maximum script length in bytes
 static const int MAX_SCRIPT_SIZE = 10000;
 
@@ -589,11 +600,12 @@ public:
      *                           check. When given, a key earns credit only if it is in the set, and the
      *                           unproven-key charge is at least what the static count alone would give.
      *                           nullptr means nothing was observed, and the static count alone applies.
+     * @param[out] ranges        If given, the ranges of this script that the second member counted.
      */
-    std::pair<size_t, size_t> DatacarrierBytes(size_t remaining_outputs, const CScriptWitness* witness = nullptr, bool dead_branches = false, const VerifiedKeys* verified_keys = nullptr, bool* reached_normal_return = nullptr) const;
+    std::pair<size_t, size_t> DatacarrierBytes(size_t remaining_outputs, const CScriptWitness* witness = nullptr, bool dead_branches = false, const VerifiedKeys* verified_keys = nullptr, bool* reached_normal_return = nullptr, DatacarrierRanges* ranges = nullptr) const;
     /** A pointer passed as dead_branches would convert to bool, with no warning for a pointer variable; this makes it a compile error. */
     template <typename T>
-    std::pair<size_t, size_t> DatacarrierBytes(size_t remaining_outputs, const CScriptWitness* witness, T* dead_branches, const VerifiedKeys* verified_keys = nullptr) const = delete;
+    std::pair<size_t, size_t> DatacarrierBytes(size_t remaining_outputs, const CScriptWitness* witness, T* dead_branches, const VerifiedKeys* verified_keys = nullptr, bool* reached_normal_return = nullptr, DatacarrierRanges* ranges = nullptr) const = delete;
 
     /** The datacarrier bytes when the dead-branch count (the .second of DatacarrierBytes) is already
      *  known from an earlier call on the same script that reached its normal return: recompute only the

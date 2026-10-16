@@ -4,6 +4,9 @@
 
 #include <policy/executed_data.h>
 
+#include <logging.h>
+#include <serialize.h>
+
 #include <algorithm>
 #include <map>
 #include <utility>
@@ -133,6 +136,7 @@ ExecutedDataTracer::Ledger ExecutedDataTracer::Finish(uint32_t lock_allowance) c
     struct Group {
         std::vector<uint32_t> constants;
         bool all_true{true};
+        bool key_hash{true};
     };
     std::map<uint32_t, Group> groups;
     m_live.ForEach([&](size_t r) {
@@ -142,10 +146,12 @@ ExecutedDataTracer::Ledger ExecutedDataTracer::Finish(uint32_t lock_allowance) c
             if (std::find(g.constants.begin(), g.constants.end(), c) == g.constants.end()) g.constants.push_back(c);
         }
         g.all_true = g.all_true && rec.true_result;
+        g.key_hash = g.key_hash && rec.key_hash;
     });
 
     std::vector<std::pair<uint32_t, uint32_t>> small; // source, credit, from groups that fit in a few bytes
     std::vector<std::pair<uint32_t, uint32_t>> ranked; // value, source
+    std::vector<uint32_t> key_locks;
     for (const auto& [s, g] : groups) {
         if (m_sources[s].code) continue;
         bool tiny{m_sources[s].len <= 4};
@@ -160,9 +166,19 @@ ExecutedDataTracer::Ledger ExecutedDataTracer::Finish(uint32_t lock_allowance) c
             for (uint32_t c : g.constants) grant(c, LOCK_CREDIT_CAP);
             continue;
         }
+        if (g.key_hash && std::all_of(g.constants.begin(), g.constants.end(), [&](uint32_t c) { return m_sources[c].len == 20; })) {
+            key_locks.push_back(s);
+            continue;
+        }
         uint32_t value{Cap(m_sources[s].len, LOCK_CREDIT_CAP)};
         for (uint32_t c : g.constants) value += Cap(m_sources[c].len, LOCK_CREDIT_CAP);
         ranked.emplace_back(value, s);
+    }
+    // Keys named by their hash have an allowance of their own, in source order, which is the same set of
+    // sources whatever order the script ran in.
+    for (size_t i = 0; i < key_locks.size() && i < KEY_LOCK_ALLOWANCE; ++i) {
+        grant(key_locks[i], m_sources[key_locks[i]].len);
+        for (uint32_t c : groups[key_locks[i]].constants) grant(c, LOCK_CREDIT_CAP);
     }
     // The largest credits win, so the outcome does not depend on the order the locks ran in.
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
@@ -497,6 +513,7 @@ void ExecutedDataTracer::Equality(bool numeric, bool verify, const Real& stack)
         rec.src = other.src;
         konst.content.ForEach([&](size_t s) { rec.constants.push_back(static_cast<uint32_t>(s)); });
         // The real result is on the stack when the comparison does not verify; otherwise it held.
+        rec.key_hash = other.key_hash;
         rec.true_result = verify || (!stack.empty() && stack.back().size() == 1 && stack.back()[0] == 1);
         m_records.push_back(std::move(rec));
         r.pending.Set(m_records.size() - 1);
@@ -821,6 +838,7 @@ void ExecutedDataTracer::Apply(const Real& stack)
             if (a.form == Form::SOURCE) {
                 r.form = Form::HASHED;
                 r.src = a.src;
+                r.key_hash = op == OP_HASH160 && (m_sources[a.src].len == 33 || m_sources[a.src].len == 65);
             }
             s.push_back(std::move(r));
             derived_top = true;
@@ -849,4 +867,240 @@ void ExecutedDataTracer::Apply(const Real& stack)
         s.back().hash = HashBytes(stack.back());
     }
     // A moved element has to still be what it was: AfterOp compares the top of the shadow with the real stack.
+}
+
+// ---- accounting ---------------------------------------------------------------------------
+
+namespace {
+//! Items of this many bytes look like signatures to the static count, and are the one thing an
+//! input that was not followed is not charged for.
+bool LooksLikeSignature(size_t size) { return size >= 64 && size <= 73; }
+
+//! The push opcodes and their data of a script that is meant to be push-only. False on anything else.
+bool ParsePushes(const CScript& script, std::vector<valtype>& out)
+{
+    CScript::const_iterator it{script.begin()};
+    opcodetype op;
+    valtype data;
+    while (it < script.end()) {
+        if (!script.GetOp(it, op, data) || op > OP_16) return false;
+        out.push_back(op == OP_0 || (op >= OP_1 && op <= OP_16) || op == OP_1NEGATE ? valtype{} : data);
+    }
+    return true;
+}
+
+/**
+ * What an input is charged when nothing could be said about which of its bytes were used: every
+ * stack source byte, except items that look like signatures. The script itself, the redeemScript,
+ * the control block and the annex are code. The implicit keys of P2PKH and P2WPKH are free, since
+ * nothing else can be done with them there.
+ */
+uint64_t ConservativeInputBytes(const CTxIn& txin, const CScript& spent_script_pub_key)
+{
+    uint64_t total{0};
+    auto charge = [&](size_t size) { if (!LooksLikeSignature(size)) total += size; };
+
+    std::vector<valtype> pushes;
+    if (!ParsePushes(txin.scriptSig, pushes)) {
+        // An executable scriptSig is all script, and the static rules count what they recognise in it.
+        pushes.clear();
+    }
+    CScript program_script{spent_script_pub_key};
+    int version{0};
+    std::vector<unsigned char> program;
+    const bool p2sh{spent_script_pub_key.IsPayToScriptHash()};
+    if (p2sh && !pushes.empty()) {
+        program_script = CScript{pushes.back().begin(), pushes.back().end()};
+        pushes.pop_back();
+    }
+    const bool p2pkh{spent_script_pub_key.size() == 25 && spent_script_pub_key[0] == OP_DUP && spent_script_pub_key[1] == OP_HASH160 &&
+                     spent_script_pub_key[2] == 20 && spent_script_pub_key[23] == OP_EQUALVERIFY && spent_script_pub_key[24] == OP_CHECKSIG};
+    for (size_t i = 0; i < pushes.size(); ++i) {
+        // The public key of a P2PKH spend is implied by the output it spends.
+        if (p2pkh && i + 1 == pushes.size() && (pushes[i].size() == 33 || pushes[i].size() == 65)) continue;
+        charge(pushes[i].size());
+    }
+
+    auto stack{txin.scriptWitness.stack};
+    if (stack.empty()) return total;
+    if (program_script.IsWitnessProgram(version, program)) {
+        if (version == 0 && program.size() == WITNESS_V0_KEYHASH_SIZE) {
+            // P2WPKH: a signature and the key the program commits to.
+            for (size_t i = 0; i + 1 < stack.size(); ++i) charge(stack[i].size());
+            return total;
+        }
+        if (version == 0 && program.size() == WITNESS_V0_SCRIPTHASH_SIZE) {
+            stack.pop_back(); // the witnessScript
+        } else if (version == 1 && program.size() == WITNESS_V1_TAPROOT_SIZE && !p2sh) {
+            if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) stack.pop_back();
+            if (stack.size() >= 2) {
+                stack.pop_back(); // the control block
+                stack.pop_back(); // the leaf script
+            }
+        }
+    }
+    for (const valtype& item : stack) charge(item.size());
+    return total;
+}
+
+bool IsFreeNumber(const valtype& data)
+{
+    if (data.size() > 5) return false;
+    try {
+        (void)CScriptNum(data, /*fRequireMinimal=*/true, /*nMaxNumSize=*/5);
+    } catch (const scriptnum_error&) {
+        return false;
+    }
+    return true;
+}
+
+struct ScriptOp {
+    size_t begin;
+    size_t end;
+    opcodetype opcode;
+    valtype data;
+};
+
+bool InRanges(const std::vector<std::pair<size_t, size_t>>& ranges, size_t offset)
+{
+    return std::any_of(ranges.begin(), ranges.end(), [&](const auto& r) { return offset >= r.first && offset < r.second; });
+}
+} // namespace
+
+size_t TraceableInputBytes(const CTxIn& txin)
+{
+    size_t size{txin.scriptSig.size()};
+    for (const auto& item : txin.scriptWitness.stack) size += item.size() + GetSizeOfCompactSize(item.size());
+    return size;
+}
+
+ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_script_pub_key, const InputTrace* trace, const DatacarrierRanges& static_ranges, size_t static_counted)
+{
+    ExecutedDataCharge charge;
+    // The static rule recognised the whole input and counted all of it.
+    if (static_ranges.whole_input) return charge;
+
+    if (!trace || trace->status != InputTrace::Status::TRACED) {
+        charge.conservative = true;
+        charge.bytes = ConservativeInputBytes(txin, spent_script_pub_key);
+        return charge;
+    }
+    const ExecutedDataTracer::Ledger& l{trace->ledger};
+    if (l.failed) {
+        charge.conservative = charge.untraceable = true;
+        charge.bytes = ConservativeInputBytes(txin, spent_script_pub_key);
+        LogWarning("Executed-data accounting could not follow an input (%s); charging it conservatively\n", l.fail_reason);
+        return charge;
+    }
+    if (l.runs.empty()) {
+        // Nothing went through the interpreter (an OP_SUCCESS leaf, an unknown witness version, an
+        // anchor output), so there is no trace to read. That is not the same as nothing to charge.
+        charge.conservative = true;
+        charge.bytes = ConservativeInputBytes(txin, spent_script_pub_key);
+        return charge;
+    }
+
+    // The run whose script the static rules looked at: the witness script or leaf, else the redeemScript,
+    // else the scriptSig of a spend that has neither.
+    int static_run{-1};
+    for (size_t r = 0; r < l.runs.size(); ++r) {
+        if (l.runs[r].kind == ScriptRunKind::WITNESS_V0_SCRIPT || l.runs[r].kind == ScriptRunKind::TAPSCRIPT) static_run = static_cast<int>(r);
+    }
+    for (size_t r = 0; static_run < 0 && r < l.runs.size(); ++r) {
+        if (l.runs[r].kind == ScriptRunKind::REDEEMSCRIPT) static_run = static_cast<int>(r);
+    }
+    for (size_t r = 0; static_run < 0 && r < l.runs.size(); ++r) {
+        if (l.runs[r].kind == ScriptRunKind::SCRIPTSIG) static_run = static_cast<int>(r);
+    }
+    auto counted_by_static = [&](uint32_t run, uint32_t offset) {
+        return static_cast<int>(run) == static_run && InRanges(static_ranges.counted, offset);
+    };
+
+    uint64_t outside{0}, total{0};
+
+    // The stack sources no check used.
+    for (size_t s = 0; s < l.sources.size(); ++s) {
+        const uint32_t data{l.DataBytes(s)};
+        if (data == 0) continue;
+        const auto& src{l.sources[s]};
+        // The push opcode and length of a push nothing used at all are part of the payload's envelope.
+        uint64_t bytes{data};
+        if (l.credited[s] == 0 && src.kind != ExecutedDataTracer::SourceKind::WITNESS_ITEM) {
+            bytes += src.overhead;
+            // A push that is dropped right away takes the drop with it, as the static envelope rule does.
+            const valtype& script{l.runs[src.run].script};
+            if (src.kind == ExecutedDataTracer::SourceKind::SCRIPT_PUSH && src.end < script.size() &&
+                (script[src.end] == OP_DROP || script[src.end] == OP_2DROP)) {
+                ++bytes;
+            }
+        }
+        total += bytes;
+        if (src.kind != ExecutedDataTracer::SourceKind::WITNESS_ITEM && counted_by_static(src.run, src.offset)) continue;
+        outside += bytes;
+    }
+
+    // The pushes in code that never ran.
+    uint32_t slots_left{l.lock_slots_left};
+    for (size_t r = 0; r < l.runs.size(); ++r) {
+        const auto& run{l.runs[r]};
+        if (run.kind != ScriptRunKind::REDEEMSCRIPT && run.kind != ScriptRunKind::WITNESS_V0_SCRIPT && run.kind != ScriptRunKind::TAPSCRIPT) continue;
+        const CScript script{run.script.begin(), run.script.end()};
+        int v{0};
+        std::vector<unsigned char> prog;
+        // The redeemScript of a nested witness program is a push of the program, which belongs to the witness.
+        if (run.kind == ScriptRunKind::REDEEMSCRIPT && script.IsWitnessProgram(v, prog)) continue;
+
+        std::vector<ScriptOp> ops;
+        {
+            CScript::const_iterator it{script.begin()};
+            while (it < script.end()) {
+                ScriptOp op;
+                op.begin = static_cast<size_t>(it - script.begin());
+                if (!script.GetOp(it, op.opcode, op.data)) {
+                    // Cannot happen for a script that ran, since the interpreter reads all of it.
+                    op.end = script.size();
+                    op.opcode = OP_INVALIDOPCODE;
+                    ops.push_back(std::move(op));
+                    break;
+                }
+                op.end = static_cast<size_t>(it - script.begin());
+                ops.push_back(std::move(op));
+            }
+        }
+        for (size_t i = 0; i < ops.size(); ++i) {
+            const ScriptOp& op{ops[i]};
+            if (std::binary_search(run.executed.begin(), run.executed.end(), static_cast<uint32_t>(op.begin))) continue;
+            const bool broken{op.opcode == OP_INVALIDOPCODE};
+            if (!broken && (op.opcode > OP_PUSHDATA4 || op.data.empty())) continue; // not a push, or an empty one
+            const uint64_t bytes{op.end - op.begin};
+            bool data{true};
+            if (!broken) {
+                const opcodetype prev{i > 0 ? ops[i - 1].opcode : OP_INVALIDOPCODE};
+                const opcodetype next{i + 1 < ops.size() ? ops[i + 1].opcode : OP_INVALIDOPCODE};
+                const size_t n{op.data.size()};
+                if (n == 33 || n == 65 || (n == 32 && (next == OP_CHECKSIG || next == OP_CHECKSIGVERIFY || next == OP_CHECKSIGADD))) {
+                    data = false; // a key: the unproven-key budget owns it
+                } else if (IsFreeNumber(op.data)) {
+                    data = false;
+                } else if (((n == 20 && (prev == OP_HASH160 || prev == OP_RIPEMD160)) || (n == 32 && (prev == OP_SHA256 || prev == OP_HASH256))) &&
+                           (next == OP_EQUAL || next == OP_EQUALVERIFY) && slots_left > 0) {
+                    --slots_left;
+                    data = false;
+                }
+            }
+            if (!data) continue;
+            total += bytes;
+            if (counted_by_static(static_cast<uint32_t>(r), static_cast<uint32_t>(op.begin))) continue;
+            outside += bytes;
+        }
+    }
+
+    if (total < static_counted) {
+        // The static rules counted bytes that this accounting does not call data (flow control inside an
+        // envelope, say). They stay counted: the charge is the static count plus what lies outside it.
+        LogDebug(BCLog::MEMPOOL, "Executed-data accounting covers %u bytes where the static count has %u\n", total, static_counted);
+    }
+    charge.bytes = outside;
+    charge.total = total;
+    return charge;
 }

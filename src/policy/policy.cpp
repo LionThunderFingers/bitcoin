@@ -13,6 +13,7 @@
 #include <consensus/validation.h>
 #include <crypto/common.h>
 #include <kernel/mempool_options.h>
+#include <policy/executed_data.h>
 #include <policy/feerate.h>
 #include <policy/settings.h>
 #include <primitives/transaction.h>
@@ -646,7 +647,8 @@ static bool FollowDeadBranches(const CTxIn& txin)
     return ::g_reject_dead_branches && GetSerializeSize(txin.scriptWitness.stack) <= g_script_size_policy_limit;
 }
 
-std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view, const std::vector<VerifiedKeys>* verified_keys, std::vector<DatacarrierInputCache>* input_cache)
+std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view, const std::vector<VerifiedKeys>* verified_keys, std::vector<DatacarrierInputCache>* input_cache,
+                                           const std::vector<InputTrace>* traces, bool* untraceable)
 {
     std::pair<size_t, size_t> ret{0, 0};
     // A set per input or none at all. A partial one is not an observation.
@@ -655,8 +657,8 @@ std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsV
     // With no verified keys this is the static count: fill the cache, one entry per input. With verified
     // keys and a cache that matches the inputs, this is the recount: reuse each input's dead-branch count
     // and recompute only its unproven-pubkey part, so the dead-branch scan is not run a second time.
-    const bool populate{input_cache && !verified_keys};
-    const bool consume{input_cache && verified_keys && input_cache->size() == tx.vin.size()};
+    const bool populate{input_cache && !traces && !verified_keys};
+    const bool consume{input_cache && !traces && verified_keys && input_cache->size() == tx.vin.size()};
     if (populate) {
         input_cache->clear();
         input_cache->reserve(tx.vin.size());
@@ -673,6 +675,9 @@ std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsV
         // the static count unchanged, byte for byte.
         const VerifiedKeys* input_keys{(verified_keys && consensus_weight_per_byte == 1) ? &(*verified_keys)[i] : nullptr};
         std::pair<size_t, size_t> dcb;
+        // Every byte has one role: the executed-data accounting below needs the ranges the full counting
+        // pass emits, so with traces the cache is neither filled nor read and every input is counted in full.
+        DatacarrierRanges ranges;
         if (populate) {
             bool normal{false};
             dcb = script.DatacarrierBytes(0, &txin.scriptWitness, FollowDeadBranches(txin), /*verified_keys=*/nullptr, &normal);
@@ -693,10 +698,18 @@ std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsV
                 dcb = {c.first, c.second};
             }
         } else {
-            dcb = script.DatacarrierBytes(0, &txin.scriptWitness, FollowDeadBranches(txin), input_keys);
+            dcb = script.DatacarrierBytes(0, &txin.scriptWitness, FollowDeadBranches(txin), input_keys, /*reached_normal_return=*/nullptr, traces ? &ranges : nullptr);
         }
         ret.first += dcb.first;
         ret.second += dcb.second;
+        if (traces) {
+            // Every byte has one role: what the static rule counted stays with it, and the executed-data
+            // accounting adds only what lies outside that.
+            const InputTrace* trace{traces->size() == tx.vin.size() ? &(*traces)[i] : nullptr};
+            const ExecutedDataCharge extra{ExecutedDataBytes(txin, utxo.scriptPubKey, trace, ranges, dcb.second)};
+            ret.second += extra.bytes;
+            if (untraceable && extra.untraceable) *untraceable = true;
+        }
     }
     if (::g_reject_bpub) ret.second += BPUBBytes(tx);
     for (size_t i{tx.vout.size()}; i; ) {

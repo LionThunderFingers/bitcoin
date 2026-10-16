@@ -2,12 +2,14 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <addresstype.h>
 #include <core_io.h>
 #include <crypto/ripemd160.h>
 #include <crypto/sha256.h>
 #include <hash.h>
 #include <policy/executed_data.h>
 #include <policy/policy.h>
+#include <policy/settings.h>
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <test/util/random.h>
@@ -129,6 +131,35 @@ size_t FindSource(const Ledger& l, ExecutedDataTracer::SourceKind kind, uint32_t
     }
     BOOST_FAIL("no such source");
     return 0;
+}
+
+//! What the policy path adds for one input of a spend, with the tracer's trace of it (or none).
+struct Charged {
+    size_t static_counted;
+    ExecutedDataCharge extra;
+};
+Charged ChargeSpend(const CScript& script_sig, const CScript& spk, const CScriptWitness& witness, bool traced = true)
+{
+    const Traced t = TraceSpend(script_sig, spk, witness);
+    BOOST_REQUIRE_MESSAGE(t.ok, ScriptErrorString(t.err));
+    BOOST_REQUIRE_MESSAGE(!t.ledger.failed, t.ledger.fail_reason);
+    CTxIn txin;
+    txin.scriptSig = script_sig;
+    txin.scriptWitness = witness;
+    const CScript script{GetScriptForTransactionInput(spk, txin).first};
+    DatacarrierRanges ranges;
+    const auto dcb = script.DatacarrierBytes(0, &witness, /*dead_branches=*/::g_reject_dead_branches, /*verified_keys=*/nullptr, /*reached_normal_return=*/nullptr, &ranges);
+    InputTrace trace;
+    trace.status = InputTrace::Status::TRACED;
+    trace.ledger = t.ledger;
+    return {dcb.second, ExecutedDataBytes(txin, spk, traced ? &trace : nullptr, ranges, dcb.second)};
+}
+CScriptWitness Wit(std::vector<valtype> items, const CScript& script)
+{
+    CScriptWitness w;
+    w.stack = std::move(items);
+    w.stack.emplace_back(script.begin(), script.end());
+    return w;
 }
 } // namespace
 
@@ -562,12 +593,12 @@ BOOST_AUTO_TEST_CASE(tapscript_unsigned_keys_are_key_budget_not_data)
 
 BOOST_AUTO_TEST_CASE(unsigned_witness_supplied_key_pays_the_difference)
 {
-    // pk_h with an empty signature: the key is hashed against the program (32 bytes credit), the rest is data.
+    // pk_h with an empty signature: the key is named by its hash, which takes the whole key out of the data.
     const valtype pk{Key(1)};
     const CScript script = CScript() << OP_DUP << OP_HASH160 << Hash160(pk) << OP_EQUALVERIFY << OP_CHECKSIG;
     const auto t = TraceWsh(script, {{}, pk});
     REQUIRE_TRACED(t);
-    BOOST_CHECK_EQUAL(t.ledger.TotalDataBytes(), 1U);
+    BOOST_CHECK_EQUAL(t.ledger.TotalDataBytes(), 0U);
     const auto signed_spend = TraceWsh(script, {Sig(), pk});
     REQUIRE_TRACED(signed_spend);
     BOOST_CHECK_EQUAL(signed_spend.ledger.TotalDataBytes(), 0U);
@@ -593,6 +624,190 @@ BOOST_AUTO_TEST_CASE(small_credit_budget_is_bounded)
     REQUIRE_TRACED(t);
     BOOST_CHECK_EQUAL(t.ledger.small_credit_used, ExecutedDataTracer::SMALL_CREDIT_BUDGET);
     BOOST_CHECK_EQUAL(t.ledger.TotalDataBytes(), 40U * 4 - ExecutedDataTracer::SMALL_CREDIT_BUDGET);
+}
+
+// ---- the charge one input gets, with the static rules and this accounting sharing one ledger ------
+
+BOOST_AUTO_TEST_CASE(accounting_tail_garbage_is_charged_with_its_push)
+{
+    const CScript script = CScript() << OP_1 << Bytes(256, 7) << Key(1) << OP_2 << OP_CHECKMULTISIG;
+    const auto c = ChargeSpend(CScript(), Wsh(script), Wit({{}, Sig()}, script));
+    BOOST_CHECK_EQUAL(c.static_counted, 0U);
+    BOOST_CHECK_EQUAL(c.extra.bytes, 256U + 3U); // the data and the PUSHDATA2 opcode and length
+    BOOST_CHECK(!c.extra.untraceable && !c.extra.conservative);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_envelope_is_counted_once)
+{
+    // OP_FALSE OP_IF <data> OP_ENDIF is counted whole by the static rule; the push inside it never runs.
+    const CScript script = CScript() << OP_FALSE << OP_IF << Bytes(200, 7) << OP_ENDIF << Key(1) << OP_CHECKSIG;
+    const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig()}, script));
+    BOOST_CHECK_GT(c.static_counted, 200U);
+    BOOST_CHECK_EQUAL(c.extra.bytes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_drop_run_is_counted_once_and_covered)
+{
+    // <data> OP_DROP, and a run of pushes dropped together: the static rule counts them, and so must this
+    // accounting (the assertion that it covers them), without adding them a second time.
+    const CScript one = CScript() << Bytes(200, 7) << OP_DROP << Key(1) << OP_CHECKSIG;
+    const auto c1 = ChargeSpend(CScript(), Wsh(one), Wit({Sig()}, one));
+    BOOST_CHECK_GT(c1.static_counted, 200U);
+    BOOST_CHECK_GE(c1.extra.total, c1.static_counted);
+    BOOST_CHECK_EQUAL(c1.extra.bytes, 0U);
+
+    const CScript run = CScript() << Bytes(100, 1) << Bytes(100, 2) << OP_2DROP << Key(1) << OP_CHECKSIG;
+    const auto c2 = ChargeSpend(CScript(), Wsh(run), Wit({Sig()}, run));
+    BOOST_CHECK_GT(c2.static_counted, 200U);
+    BOOST_CHECK_GE(c2.extra.total, c2.static_counted);
+    BOOST_CHECK_EQUAL(c2.extra.bytes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_dropped_witness_items_are_charged)
+{
+    // 18 items of 80 bytes dropped at the front, which the static rules cannot see.
+    CScript script;
+    for (int i = 0; i < 9; ++i) script << OP_2DROP;
+    script << Key(1) << OP_CHECKSIG;
+    std::vector<valtype> items{Sig()};
+    for (int i = 0; i < 18; ++i) items.push_back(Bytes(80, static_cast<unsigned char>(i)));
+    const auto c = ChargeSpend(CScript(), Wsh(script), Wit(items, script));
+    BOOST_CHECK_EQUAL(c.extra.bytes, 18U * 80U);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_untaken_branch_data)
+{
+    // A witness-chosen branch that does not run: its push is data in full, opcode and length included.
+    const CScript script = CScript() << OP_IF << Bytes(100, 7) << OP_SHA256 << OP_DROP << OP_ENDIF << Key(1) << OP_CHECKSIG;
+    const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
+    BOOST_CHECK_EQUAL(c.extra.bytes, 102U); // 100 bytes, PUSHDATA1 and its length
+}
+
+BOOST_AUTO_TEST_CASE(accounting_untaken_hash_slots_three_free_fourth_charged)
+{
+    for (const int slots : {3, 4}) {
+        CScript script = CScript() << OP_IF;
+        for (int i = 0; i < slots; ++i) script << OP_HASH160 << Bytes(20, static_cast<unsigned char>(i)) << OP_EQUALVERIFY;
+        script << OP_ENDIF << Key(1) << OP_CHECKSIG;
+        const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
+        BOOST_CHECK_EQUAL(c.extra.bytes, slots == 3 ? 0U : 21U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(accounting_untaken_keys_and_numbers_are_free)
+{
+    // The unproven-key budget owns untaken keys; small minimal numbers are free.
+    const CScript script = CScript() << OP_IF << Key(2) << XKey(3) << OP_CHECKSIG << Bytes(5, 1) << OP_DROP << OP_ENDIF << Key(1) << OP_CHECKSIG;
+    const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
+    BOOST_CHECK_EQUAL(c.extra.bytes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_not_followed_is_charged_conservatively)
+{
+    // A preimage and a signature: the signature-shaped item is free, the preimage is data.
+    const valtype preimage{Bytes(32, 9)};
+    const CScript script = CScript() << OP_SHA256 << Sha256(preimage) << OP_EQUAL;
+    const CScriptWitness w{Wit({preimage}, script)};
+    const auto traced = ChargeSpend(CScript(), Wsh(script), w);
+    BOOST_CHECK_EQUAL(traced.extra.bytes, 0U); // credited by its lock
+    const auto untraced = ChargeSpend(CScript(), Wsh(script), w, /*traced=*/false);
+    BOOST_CHECK(untraced.extra.conservative);
+    BOOST_CHECK_EQUAL(untraced.extra.bytes, 32U);
+
+    CScriptWitness sig_like;
+    sig_like.stack = {Bytes(70, 1), Bytes(64, 2), Bytes(63, 3), {}, valtype(script.begin(), script.end())};
+    CTxIn txin;
+    txin.scriptWitness = sig_like;
+    const auto none = ExecutedDataBytes(txin, Wsh(script), nullptr, DatacarrierRanges{}, 0);
+    BOOST_CHECK(none.conservative);
+    BOOST_CHECK_EQUAL(none.bytes, 63U); // the script is code, 64 and 70 byte items look like signatures
+}
+
+BOOST_AUTO_TEST_CASE(accounting_conservative_charge_per_script_type)
+{
+    CTxIn txin;
+    // P2WPKH: nothing is charged, its key and signature are implied by the output.
+    txin.scriptWitness.stack = {Bytes(71, 1), Key(1)};
+    BOOST_CHECK_EQUAL(ExecutedDataBytes(txin, CScript() << OP_0 << Hash160(Key(1)), nullptr, DatacarrierRanges{}, 0).bytes, 0U);
+    // P2PKH likewise.
+    CTxIn legacy;
+    legacy.scriptSig = CScript() << Bytes(71, 1) << Key(1);
+    BOOST_CHECK_EQUAL(ExecutedDataBytes(legacy, CScript() << OP_DUP << OP_HASH160 << Hash160(Key(1)) << OP_EQUALVERIFY << OP_CHECKSIG, nullptr, DatacarrierRanges{}, 0).bytes, 0U);
+    // Taproot key path: one signature. Script path: the leaf and control block are code, the rest is data.
+    CTxIn key_path;
+    key_path.scriptWitness.stack = {Bytes(64, 1)};
+    const CScript tr = CScript() << OP_1 << Bytes(32, 5);
+    BOOST_CHECK_EQUAL(ExecutedDataBytes(key_path, tr, nullptr, DatacarrierRanges{}, 0).bytes, 0U);
+    CTxIn script_path;
+    script_path.scriptWitness.stack = {Bytes(50, 1), Bytes(30, 2), Bytes(100, 3), Bytes(33, 4)};
+    BOOST_CHECK_EQUAL(ExecutedDataBytes(script_path, tr, nullptr, DatacarrierRanges{}, 0).bytes, 80U);
+    // An anchor output spent with nothing.
+    BOOST_CHECK_EQUAL(ExecutedDataBytes(CTxIn{}, CScript() << OP_1 << valtype{0x4e, 0x73}, nullptr, DatacarrierRanges{}, 0).bytes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_failed_model_is_flagged_and_charged)
+{
+    InputTrace trace;
+    trace.status = InputTrace::Status::TRACED;
+    trace.ledger.failed = true;
+    trace.ledger.fail_reason = "test";
+    CTxIn txin;
+    txin.scriptWitness.stack = {Bytes(32, 1), Bytes(10, 2)};
+    const auto c = ExecutedDataBytes(txin, CScript() << OP_0 << Bytes(32, 5), &trace, DatacarrierRanges{}, 0);
+    BOOST_CHECK(c.untraceable && c.conservative);
+    BOOST_CHECK_EQUAL(c.bytes, 32U);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_static_owned_input_is_not_added_to)
+{
+    DatacarrierRanges owned;
+    owned.whole_input = true;
+    CTxIn txin;
+    txin.scriptWitness.stack = {Bytes(300, 1), Bytes(10, 2)};
+    BOOST_CHECK_EQUAL(ExecutedDataBytes(txin, CScript() << OP_1 << Bytes(32, 5), nullptr, owned, 0).bytes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_unsigned_pk_h_has_its_own_allowance)
+{
+    // n times <sig> <key> DUP HASH160 <hash> EQUALVERIFY CHECKSIG DROP, every signature empty: the unsigned
+    // pk_h of a miniscript thresh. Ten are free, as ten unproven keys are, and the eleventh is data with its hash.
+    for (const int n : {1, 4, 6, 10, 11}) {
+        CScript script;
+        std::vector<valtype> items;
+        for (int i = n; i >= 1; --i) {
+            items.push_back({});
+            items.push_back(Key(static_cast<unsigned char>(i)));
+        }
+        for (int i = 1; i <= n; ++i) script << OP_DUP << OP_HASH160 << Hash160(Key(static_cast<unsigned char>(i))) << OP_EQUALVERIFY << OP_CHECKSIG << OP_DROP;
+        script << OP_1;
+        const auto c = ChargeSpend(CScript(), Wsh(script), Wit(items, script));
+        BOOST_CHECK_EQUAL(c.extra.bytes, n <= 10 ? 0U : 54U); // the key, and its 20 byte hash with its push opcode
+    }
+}
+
+BOOST_AUTO_TEST_CASE(accounting_honest_spends_pay_nothing)
+{
+    // P2WSH 1-of-1, the anchor swept after 16 blocks with an empty signature, P2SH 3-of-5, P2SH-P2WSH.
+    const CScript one = CScript() << OP_1 << Key(1) << OP_1 << OP_CHECKMULTISIG;
+    BOOST_CHECK_EQUAL(ChargeSpend(CScript(), Wsh(one), Wit({{}, Sig()}, one)).extra.bytes, 0U);
+
+    const CScript anchor = CScript() << Key(1) << OP_CHECKSIG << OP_IFDUP << OP_NOTIF << OP_16 << OP_CHECKSEQUENCEVERIFY << OP_ENDIF;
+    for (const bool signed_spend : {false, true}) {
+        BOOST_CHECK_EQUAL(ChargeSpend(CScript(), Wsh(anchor), Wit({signed_spend ? Sig() : valtype{}}, anchor)).extra.bytes, 0U);
+    }
+
+    const CScript multisig = CScript() << OP_3 << Key(1) << Key(2) << Key(3) << Key(4) << Key(5) << OP_5 << OP_CHECKMULTISIG;
+    const CScript p2sh = GetScriptForDestination(ScriptHash(multisig));
+    const CScript sig_script = CScript() << OP_0 << Sig() << Sig() << Sig() << valtype(multisig.begin(), multisig.end());
+    BOOST_CHECK_EQUAL(ChargeSpend(sig_script, p2sh, CScriptWitness()).extra.bytes, 0U);
+
+    const CScript wsh_inner = CScript() << OP_1 << Key(1) << OP_1 << OP_CHECKMULTISIG;
+    const CScript program = Wsh(wsh_inner);
+    const CScript nested = GetScriptForDestination(ScriptHash(program));
+    BOOST_CHECK_EQUAL(ChargeSpend(CScript() << valtype(program.begin(), program.end()), nested, Wit({{}, Sig()}, wsh_inner)).extra.bytes, 0U);
+
+    const valtype pk{Key(1)};
+    BOOST_CHECK_EQUAL(ChargeSpend(CScript() << Sig() << pk, CScript() << OP_DUP << OP_HASH160 << Hash160(pk) << OP_EQUALVERIFY << OP_CHECKSIG, CScriptWitness()).extra.bytes, 0U);
 }
 
 // ---- the model must hold for every script -----------------------------------------------------

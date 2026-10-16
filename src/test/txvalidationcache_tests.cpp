@@ -29,7 +29,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        std::vector<CScriptCheck>* pvChecks,
                        const std::vector<unsigned int>& flags_per_input = {},
                        std::vector<VerifiedKeys>* verified_keys = nullptr,
-                       std::vector<SigCheckLog>* sig_check_logs = nullptr
+                       std::vector<SigCheckLog>* sig_check_logs = nullptr,
+                       std::vector<InputTrace>* traces = nullptr
 ) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 BOOST_AUTO_TEST_SUITE(txvalidationcache_tests)

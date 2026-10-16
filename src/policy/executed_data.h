@@ -5,6 +5,7 @@
 #ifndef BITCOIN_POLICY_EXECUTED_DATA_H
 #define BITCOIN_POLICY_EXECUTED_DATA_H
 
+#include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/script.h>
 
@@ -89,6 +90,10 @@ public:
     //! Locks (comparisons that check a witness-supplied value against a constant) that may spend
     //! their credit for free in one input, counting distinct credited sources.
     static constexpr uint32_t LOCK_ALLOWANCE{3};
+    //! Locks of the form <key> HASH160 <20 byte hash> EQUAL, the pk_h of miniscript, that may take their
+    //! credit apart from LOCK_ALLOWANCE. An honest thresh can hold many keys it does not sign with, and
+    //! each is named by a hash. Ten matches the unproven public keys one input may carry for free (PR1).
+    static constexpr uint32_t KEY_LOCK_ALLOWANCE{10};
     //! A hash lock credits at most this much of its witness-side source and of each constant.
     static constexpr uint32_t LOCK_CREDIT_CAP{32};
     //! Total bytes of small-value credit (counts, lock times, depths, raw conditions, numeric
@@ -164,6 +169,8 @@ private:
         Form form{Form::OTHER};
         //! The result of a comparison or a signature check, as opposed to a raw value.
         bool result{false};
+        //! HASHED by HASH160 from a source of the length of a public key: the shape of a pk_h.
+        bool key_hash{false};
         //! Length and hash of the real value, used to check pure moves.
         uint32_t len{0};
         uint64_t hash{0};
@@ -173,6 +180,7 @@ private:
         uint32_t src;                   //!< the single witness-side source
         std::vector<uint32_t> constants; //!< sources of the constant side
         bool true_result;               //!< the comparison held
+        bool key_hash;                  //!< the witness side is HASH160 of a key-sized source
     };
 
     using Stack = std::vector<Elem>;
@@ -234,5 +242,53 @@ private:
     bool m_pre_ok{false};
     size_t m_window{8};
 };
+
+/** What the policy script check could tell about one input. */
+struct InputTrace {
+    enum class Status : uint8_t {
+        NOT_RUN,      //!< nothing was observed: the script execution cache answered, or this is not a policy check
+        TRACED,       //!< the tracer followed the input
+        TOO_LARGE,    //!< the input carries more than MAX_TRACED_INPUT_BYTES, so it was not followed
+        LOG_OVERFLOW, //!< the input made more signature checks than the recorder keeps
+    };
+    Status status{Status::NOT_RUN};
+    ExecutedDataTracer::Ledger ledger;
+};
+
+//! The most scriptSig and witness bytes of one input that the tracer will follow, however large
+//! -maxscriptsize is set. Past it the input is charged as if untraced.
+static constexpr size_t MAX_TRACED_INPUT_BYTES{10000};
+
+/** Serialized size of the scriptSig and the witness of an input, the measure MAX_TRACED_INPUT_BYTES is against. */
+size_t TraceableInputBytes(const CTxIn& txin);
+
+/** What the executed-data accounting adds to the static data count of one input. */
+struct ExecutedDataCharge {
+    //! Data bytes not already counted by the static rules: the second member of DatacarrierBytes.
+    uint64_t bytes{0};
+    //! All the bytes this accounting calls data, including those inside ranges the static rules counted.
+    //! At least the static count for every shape the static rules recognise (tested).
+    uint64_t total{0};
+    //! The tracer's model broke. The bytes are then the conservative charge, and the caller rejects
+    //! with txn-datacarrier-untraceable unless that is ignored.
+    bool untraceable{false};
+    //! The input was not followed, so bytes is the conservative charge.
+    bool conservative{false};
+};
+
+/**
+ * The data bytes of one input that the static rules did not count: every byte of every stack source
+ * that no check used, up to the credits of ExecutedDataTracer, plus the pushes in code that never ran
+ * that are not keys, small numbers or one of the few hash slots the allowance covers. A byte inside
+ * a range the static rule counted is paid for by that rule alone.
+ *
+ * An input that was not followed (no trace, too large, a log that overflowed, a script that ran no
+ * interpreter at all) is charged conservatively: every stack source byte except items that look
+ * like signatures. A trace whose model failed is charged the same way and flagged.
+ *
+ * @param[in] static_counted  The second member the static rules returned for this input, for the check
+ *                            that this accounting covers at least what they cover.
+ */
+ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_script_pub_key, const InputTrace* trace, const DatacarrierRanges& static_ranges, size_t static_counted);
 
 #endif // BITCOIN_POLICY_EXECUTED_DATA_H
