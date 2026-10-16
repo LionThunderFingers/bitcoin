@@ -433,14 +433,17 @@ std::pair<CScript, unsigned int> GetScriptForTransactionInput(CScript prevScript
     return std::make_pair(CScript(), 0);
 }
 
-std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view)
+std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsViewCache& view, const std::vector<VerifiedKeys>* verified_keys)
 {
     std::pair<size_t, size_t> ret{0, 0};
+    // A set per input or none at all. A partial one is not an observation.
+    if (verified_keys && verified_keys->size() != tx.vin.size()) verified_keys = nullptr;
 
-    for (const CTxIn& txin : tx.vin) {
+    for (size_t i{0}; i < tx.vin.size(); ++i) {
+        const CTxIn& txin = tx.vin[i];
         const CTxOut &utxo = view.AccessCoin(txin.prevout).out;
         auto[script, consensus_weight_per_byte] = GetScriptForTransactionInput(utxo.scriptPubKey, txin);
-        const auto dcb = script.DatacarrierBytes(0, &txin.scriptWitness);
+        const auto dcb = script.DatacarrierBytes(0, &txin.scriptWitness, verified_keys ? &(*verified_keys)[i] : nullptr);
         ret.first += dcb.first;
         ret.second += dcb.second;
     }
