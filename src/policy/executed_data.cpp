@@ -360,7 +360,9 @@ void ExecutedDataTracer::BeginRun(const CScript& script, SigVersion sigversion, 
                 const uint32_t len{static_cast<uint32_t>(stack[i].size())};
                 const uint32_t overhead{len < 253 ? 1U : 3U};
                 Elem e;
-                if (len > 0) {
+                {
+                    // An empty item is a source too. It holds no bytes, but a script that compares it with
+                    // a constant is checking what the spender supplied, not another constant of its own.
                     const uint32_t s{NewSource(SourceKind::WITNESS_ITEM, true, static_cast<uint32_t>(i), 0, 0, len, overhead)};
                     e.content.Set(s);
                     e.src = s;
@@ -637,7 +639,8 @@ void ExecutedDataTracer::Apply(const Real& stack)
         if (stack.empty()) throw ModelError{"push without a result"};
         const valtype& data{stack.back()};
         Elem e;
-        if (!data.empty()) {
+        // An empty push in a scriptSig is a source for the same reason an empty witness item is.
+        if (!data.empty() || m_kind == ScriptRunKind::SCRIPTSIG) {
             const uint32_t len{static_cast<uint32_t>(data.size())};
             const uint32_t overhead{static_cast<uint32_t>(m_end - m_start) - len};
             const bool in_sig{m_kind == ScriptRunKind::SCRIPTSIG};

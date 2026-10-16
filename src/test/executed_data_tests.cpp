@@ -785,6 +785,37 @@ BOOST_AUTO_TEST_CASE(accounting_unsigned_pk_h_has_its_own_allowance)
     }
 }
 
+BOOST_AUTO_TEST_CASE(accounting_tapscript_untaken_branch_with_reduced_data_off)
+{
+    // On this chain a tapscript has no untaken code, since OP_IF is banned. Once the reduced data rules expire
+    // it has, and an untaken push is data in full there exactly as in a P2WSH script.
+    const unsigned int flags{FLAGS & ~REDUCED_DATA_VERIFY_FLAGS};
+    const CScript script = CScript() << OP_IF << Bytes(70, 9) << OP_SHA256 << OP_DROP << OP_ENDIF << XKey(1) << OP_CHECKSIG;
+    for (const bool taken : {false, true}) {
+        const auto t = TraceTap(script, {Schnorr(), taken ? valtype{1} : valtype{}}, flags);
+        REQUIRE_TRACED(t);
+        InputTrace trace;
+        trace.status = InputTrace::Status::TRACED;
+        trace.ledger = t.ledger;
+        const auto c = ExecutedDataBytes(CTxIn{}, CScript(), &trace, DatacarrierRanges{}, 0);
+        BOOST_CHECK_EQUAL(c.bytes, 71U); // 70 bytes and the push opcode, whether it ran or not
+    }
+}
+
+BOOST_AUTO_TEST_CASE(accounting_empty_witness_item_is_a_source)
+{
+    // The timeout path of a BOLT 3 HTLC compares an empty item with the hash of the revocation key. The empty
+    // item is the spender's, so the comparison is a lock and the 20 byte constant is credited; if the empty
+    // item counted as a constant, the comparison would check nothing and the hash would be data.
+    const CScript script = CScript() << OP_DUP << OP_HASH160 << Hash160(Key(9)) << OP_EQUAL << OP_IF << OP_CHECKSIG << OP_ELSE << OP_DROP << Key(1) << OP_CHECKSIG << OP_ENDIF;
+    const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
+    BOOST_CHECK_EQUAL(c.extra.bytes, 0U);
+    // And an empty scriptSig push (OP_0) in a P2SH spend is a source the same way.
+    const CScript redeem = CScript() << OP_DUP << OP_HASH160 << Hash160(Key(9)) << OP_EQUAL << OP_IF << OP_CHECKSIG << OP_ELSE << OP_DROP << Key(1) << OP_CHECKSIG << OP_ENDIF;
+    const CScript spk = GetScriptForDestination(ScriptHash(redeem));
+    BOOST_CHECK_EQUAL(ChargeSpend(CScript() << Sig() << OP_0 << valtype(redeem.begin(), redeem.end()), spk, CScriptWitness()).extra.bytes, 0U);
+}
+
 BOOST_AUTO_TEST_CASE(accounting_honest_spends_pay_nothing)
 {
     // P2WSH 1-of-1, the anchor swept after 16 blocks with an empty signature, P2SH 3-of-5, P2SH-P2WSH.
