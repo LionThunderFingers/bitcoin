@@ -68,6 +68,8 @@ from test_framework.script import (
     OP_NIP,
     OP_NOTIF,
     OP_NUMEQUAL,
+    OP_OVER,
+    OP_ROT,
     OP_SHA256,
     OP_SIZE,
     OP_SWAP,
@@ -467,6 +469,7 @@ class ExecutedDataTest(BitcoinTestFramework):
 
         self.bolt3()
         self.other_honest()
+        self.corpus_shapes()
 
     def bolt3(self):
         """The scripts of BOLT 3, typed in from the text of the specification (not fetched here, so a
@@ -544,6 +547,33 @@ class ExecutedDataTest(BitcoinTestFramework):
         xo = compute_xonly_pubkey(xp)[0]
         leaf = CScript([OP_SHA256, sha256(pre), OP_EQUALVERIFY, xo, OP_CHECKSIG])
         self.check(self.spend_many([self.tap(leaf, lambda tx, i, h: [sign_schnorr(xp, h), pre])]), 0, "tapscript swap with the preimage")
+
+    def corpus_shapes(self):
+        """Honest scripts that the corpus replay of the 144 blocks found charged by an earlier version of the accounting."""
+        self.log.info("Corpus-derived rows: submarine swap with key hashes, selector of key hash pairs")
+        # A submarine swap: IF SIZE 32 EQUALVERIFY SHA256 <h> EQUALVERIFY DUP HASH160 <claim> ELSE <t> CLTV DROP DUP HASH160 <refund> ENDIF EQUALVERIFY CHECKSIG
+        claim, refund = self.newkey(), self.newkey()
+        pre = nz(32)
+        swap = CScript([OP_IF, OP_SIZE, 32, OP_EQUALVERIFY, OP_SHA256, sha256(pre), OP_EQUALVERIFY, OP_DUP, OP_HASH160, hash160(self.pub(claim)),
+                        OP_ELSE, 100, OP_CHECKLOCKTIMEVERIFY, OP_DROP, OP_DUP, OP_HASH160, hash160(self.pub(refund)), OP_ENDIF, OP_EQUALVERIFY, OP_CHECKSIG])
+        self.check(self.spend(swap, lambda tx, i: [self.p2wsh_sig(claim, swap, tx, i), self.pub(claim), pre, b'\x01']), 0, "key-hash swap, claim")
+        self.check(self.spend(swap, lambda tx, i: [self.p2wsh_sig(refund, swap, tx, i), self.pub(refund), b''], sequence=0xfffffffe, locktime=100), 0, "key-hash swap, refund")
+
+        # A selector: every branch names two key hashes up front, the spender picks the branch with a number.
+        # DUP 1 EQUAL IF DROP <h1> <h2> ELSE DUP 2 EQUAL IF DROP <h1> <h3> ELSE DUP 3 EQUAL IF DROP <h3> <h4> ELSE 4 EQUALVERIFY <h3> <h5> ENDIF ENDIF ENDIF
+        # ROT HASH160 EQUALVERIFY OVER HASH160 EQUALVERIFY CHECKSIG
+        ks = [self.newkey() for _ in range(5)]
+        h = [hash160(self.pub(k)) for k in ks]
+        sel = CScript([OP_DUP, 1, OP_EQUAL, OP_IF, OP_DROP, h[0], h[1], OP_ELSE, OP_DUP, 2, OP_EQUAL, OP_IF, OP_DROP, h[0], h[2],
+                       OP_ELSE, OP_DUP, 3, OP_EQUAL, OP_IF, OP_DROP, h[2], h[3], OP_ELSE, 4, OP_EQUALVERIFY, h[2], h[4], OP_ENDIF, OP_ENDIF, OP_ENDIF,
+                       OP_ROT, OP_HASH160, OP_EQUALVERIFY, OP_OVER, OP_HASH160, OP_EQUALVERIFY, OP_CHECKSIG])
+        for choice, (a, b) in ((1, (0, 1)), (2, (0, 2)), (3, (2, 3)), (4, (2, 4))):
+            # The stack under the selector: signature, the key hashed against the first hash, the key hashed against the second.
+            self.check(self.spend(sel, lambda tx, i: [self.p2wsh_sig(ks[a], sel, tx, i), self.pub(ks[a]), self.pub(ks[b]), bytes([choice])]), 0, f"selector script, branch {choice} (P2WSH)")
+        # The same script behind P2SH-P2WSH, as on the corpus.
+        self.check(self.spend_many([{'spk': script_to_p2sh_p2wsh_script(sel),
+                                     'script_sig': lambda tx, i: CScript([bytes(script_to_p2wsh_script(sel))]),
+                                     'stack': lambda tx, i: [self.p2wsh_sig(ks[0], sel, tx, i), self.pub(ks[0]), self.pub(ks[1]), b'\x01', bytes(sel)]}]), 0, "selector script (P2SH-P2WSH)")
 
     def miniscript_rows(self):
         """Scripts made by the miniscript implementation of the tree (src/test/miniscript_tests.cpp,

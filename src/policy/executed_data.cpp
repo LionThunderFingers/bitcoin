@@ -180,6 +180,7 @@ ExecutedDataTracer::Ledger ExecutedDataTracer::Finish(uint32_t lock_allowance) c
         grant(key_locks[i], m_sources[key_locks[i]].len);
         for (uint32_t c : groups[key_locks[i]].constants) grant(c, LOCK_CREDIT_CAP);
     }
+    l.key_lock_slots_left = KEY_LOCK_ALLOWANCE - static_cast<uint32_t>(std::min<size_t>(key_locks.size(), KEY_LOCK_ALLOWANCE));
     // The largest credits win, so the outcome does not depend on the order the locks ran in.
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
     for (size_t i = 0; i < ranked.size() && i < lock_allowance; ++i) {
@@ -531,6 +532,11 @@ void ExecutedDataTracer::Equality(bool numeric, bool verify, const Real& stack)
             DirectCredit(a, 4);
             DirectCredit(b, 4);
         }
+        // A value built from no source at all, OP_0 to OP_16 or OP_1NEGATE, is no constant of the kind a lock
+        // compares against, but a spender-chosen selector tested against one (DUP 1 EQUAL IF) is as much a
+        // small value as a count is.
+        const bool a_empty{a.content.None() && a.length.None()}, b_empty{b.content.None() && b.length.None()};
+        if (a_empty != b_empty) DirectCredit(a_empty ? b : a, 4);
     }
     if (verify) {
         Decide(r);
@@ -1044,6 +1050,7 @@ ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_scr
 
     // The pushes in code that never ran.
     uint32_t slots_left{l.lock_slots_left};
+    uint32_t key_slots_left{l.key_lock_slots_left};
     for (size_t r = 0; r < l.runs.size(); ++r) {
         const auto& run{l.runs[r]};
         if (run.kind != ScriptRunKind::REDEEMSCRIPT && run.kind != ScriptRunKind::WITNESS_V0_SCRIPT && run.kind != ScriptRunKind::TAPSCRIPT) continue;
@@ -1070,6 +1077,14 @@ ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_scr
                 ops.push_back(std::move(op));
             }
         }
+        // A constant that waits for a hash opcode further on is as typed as one that follows it: branches merge
+        // before the comparison, and a script may push all its hashes first. Only a script that hashes at all can
+        // hold such a constant.
+        bool hashes160{false}, hashes256{false};
+        for (const ScriptOp& op : ops) {
+            if (op.opcode == OP_HASH160 || op.opcode == OP_RIPEMD160) hashes160 = true;
+            if (op.opcode == OP_SHA256 || op.opcode == OP_HASH256) hashes256 = true;
+        }
         for (size_t i = 0; i < ops.size(); ++i) {
             const ScriptOp& op{ops[i]};
             if (std::binary_search(run.executed.begin(), run.executed.end(), static_cast<uint32_t>(op.begin))) continue;
@@ -1078,15 +1093,16 @@ ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_scr
             const uint64_t bytes{op.end - op.begin};
             bool data{true};
             if (!broken) {
-                const opcodetype prev{i > 0 ? ops[i - 1].opcode : OP_INVALIDOPCODE};
                 const opcodetype next{i + 1 < ops.size() ? ops[i + 1].opcode : OP_INVALIDOPCODE};
                 const size_t n{op.data.size()};
                 if (n == 33 || n == 65 || (n == 32 && (next == OP_CHECKSIG || next == OP_CHECKSIGVERIFY || next == OP_CHECKSIGADD))) {
                     data = false; // a key: the unproven-key budget owns it
                 } else if (IsFreeNumber(op.data)) {
                     data = false;
-                } else if (((n == 20 && (prev == OP_HASH160 || prev == OP_RIPEMD160)) || (n == 32 && (prev == OP_SHA256 || prev == OP_HASH256))) &&
-                           (next == OP_EQUAL || next == OP_EQUALVERIFY) && slots_left > 0) {
+                } else if (n == 20 && hashes160 && key_slots_left > 0) {
+                    --key_slots_left; // a key named by its hash: shares the allowance of the executed pk_h locks
+                    data = false;
+                } else if (n == 32 && hashes256 && slots_left > 0) {
                     --slots_left;
                     data = false;
                 }

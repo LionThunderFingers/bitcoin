@@ -74,6 +74,9 @@ public:
         //! Lock allowance slots in use by executed locks, and left over for untaken typed slots.
         uint32_t lock_slots_used{0};
         uint32_t lock_slots_left{0};
+        //! Slots of the allowance for keys named by their hash (KEY_LOCK_ALLOWANCE) that executed locks left unused.
+        //! Untaken pushes of the size of a HASH160 draw on them.
+        uint32_t key_lock_slots_left{0};
         //! Small-value credit bytes spent, out of the per-input budget.
         uint32_t small_credit_used{0};
 

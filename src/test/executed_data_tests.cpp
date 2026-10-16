@@ -547,6 +547,37 @@ BOOST_AUTO_TEST_CASE(honest_bolt3_anchor)
     }
 }
 
+BOOST_AUTO_TEST_CASE(honest_submarine_swap)
+{
+    // IF SIZE 32 EQUALVERIFY SHA256 <h> EQUALVERIFY DUP HASH160 <claim> ELSE <timeout> CLTV DROP DUP HASH160 <refund> ENDIF EQUALVERIFY CHECKSIG
+    // as it is on the corpus: the refund hash of the branch that does not run follows HASH160 and waits for EQUALVERIFY after ENDIF.
+    const valtype preimage{Bytes(32, 3)}, claim_key{Key(4)}, refund_key{Key(5)};
+    const CScript script = CScript() << OP_IF << OP_SIZE << valtype{32} << OP_EQUALVERIFY << OP_SHA256 << Sha256(preimage) << OP_EQUALVERIFY
+                                     << OP_DUP << OP_HASH160 << Hash160(claim_key) << OP_ELSE << CScriptNum(0x6ad1ee00).getvch() << OP_CHECKLOCKTIMEVERIFY << OP_DROP
+                                     << OP_DUP << OP_HASH160 << Hash160(refund_key) << OP_ENDIF << OP_EQUALVERIFY << OP_CHECKSIG;
+    const auto claim = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), claim_key, preimage, {1}}, script));
+    BOOST_CHECK_EQUAL(claim.extra.bytes, 0U);
+    const auto refund = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), refund_key, {}}, script));
+    BOOST_CHECK_EQUAL(refund.extra.bytes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(honest_selector_of_key_hash_pairs)
+{
+    // DUP 1 EQUAL IF DROP <h1> <h2> ELSE DUP 2 EQUAL IF DROP <h1> <h3> ELSE ... ENDIF ENDIF ROT HASH160 EQUALVERIFY OVER HASH160 EQUALVERIFY CHECKSIG
+    // (P2SH-P2WSH on the corpus): every branch pushes its two key hashes up front, so the three branches
+    // that do not run hold six pushes of 20 bytes that no HASH160 precedes.
+    const valtype k1{Key(1)}, k2{Key(2)};
+    CScript script = CScript() << OP_DUP << OP_1 << OP_EQUAL << OP_IF << OP_DROP << Hash160(k1) << Hash160(k2);
+    for (unsigned char b = 2; b <= 3; ++b) {
+        script << OP_ELSE << OP_DUP << CScriptNum(b).getvch() << OP_EQUAL << OP_IF << OP_DROP << Bytes(20, b) << Bytes(20, static_cast<unsigned char>(b + 10));
+    }
+    script << OP_ELSE << CScriptNum(4).getvch() << OP_EQUALVERIFY << Bytes(20, 4) << Bytes(20, 14);
+    for (int i = 0; i < 3; ++i) script << OP_ENDIF;
+    script << OP_ROT << OP_HASH160 << OP_EQUALVERIFY << OP_OVER << OP_HASH160 << OP_EQUALVERIFY << OP_CHECKSIG;
+    const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), k1, k2, {1}}, script));
+    BOOST_CHECK_EQUAL(c.extra.bytes, 0U);
+}
+
 BOOST_AUTO_TEST_CASE(honest_p2pkh)
 {
     const valtype pk{Key(1)};
@@ -690,11 +721,27 @@ BOOST_AUTO_TEST_CASE(accounting_untaken_hash_slots_three_free_fourth_charged)
 {
     for (const int slots : {3, 4}) {
         CScript script = CScript() << OP_IF;
+        for (int i = 0; i < slots; ++i) script << OP_SHA256 << Bytes(32, static_cast<unsigned char>(i)) << OP_EQUALVERIFY;
+        script << OP_ENDIF << Key(1) << OP_CHECKSIG;
+        const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
+        BOOST_CHECK_EQUAL(c.extra.bytes, slots == 3 ? 0U : 33U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(accounting_untaken_key_hashes_ten_free_eleventh_charged)
+{
+    // Keys named by their hash share the allowance of the executed pk_h locks. The hash may follow HASH160,
+    // wait for it after a merge of branches (a submarine swap), or be pushed up front (a selector script).
+    for (const int slots : {10, 11}) {
+        CScript script = CScript() << OP_IF;
         for (int i = 0; i < slots; ++i) script << OP_HASH160 << Bytes(20, static_cast<unsigned char>(i)) << OP_EQUALVERIFY;
         script << OP_ENDIF << Key(1) << OP_CHECKSIG;
         const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
-        BOOST_CHECK_EQUAL(c.extra.bytes, slots == 3 ? 0U : 21U);
+        BOOST_CHECK_EQUAL(c.extra.bytes, slots == 10 ? 0U : 21U);
     }
+    // 20 byte pushes in a script that never hashes are not key hashes.
+    CScript plain = CScript() << OP_IF << Bytes(20, 1) << OP_EQUAL << OP_DROP << OP_ENDIF << Key(1) << OP_CHECKSIG;
+    BOOST_CHECK_EQUAL(ChargeSpend(CScript(), Wsh(plain), Wit({Sig(), {}}, plain)).extra.bytes, 21U);
 }
 
 BOOST_AUTO_TEST_CASE(accounting_untaken_keys_and_numbers_are_free)
