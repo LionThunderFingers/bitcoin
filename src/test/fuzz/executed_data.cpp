@@ -2,7 +2,11 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <consensus/amount.h>
 #include <policy/executed_data.h>
+#include <policy/policy.h>
+#include <policy/settings.h>
+#include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <test/fuzz/FuzzedDataProvider.h>
@@ -74,6 +78,34 @@ FUZZ_TARGET(executed_data_trace)
         CScriptWitness witness;
         witness.stack = ConsumeStack(provider);
         (void)VerifyScript(script_sig, script_pub_key, &witness, flags, checker, nullptr);
+        auto ledger{tracer.Finish()};
+        CheckLedger(ledger);
+
+        // The policy accounting on top of the same trace: it must cover what the static rules count, never
+        // fail the model, and give the same answer when asked twice.
+        CTxIn txin;
+        txin.scriptSig = script_sig;
+        txin.scriptWitness = witness;
+        const CScript script = GetScriptForTransactionInput(script_pub_key, txin).first;
+        DatacarrierRanges ranges;
+        const auto dcb = script.DatacarrierBytes(0, &witness, /*dead_branches=*/::g_reject_dead_branches, /*verified_keys=*/nullptr, /*reached_normal_return=*/nullptr, &ranges);
+        InputTrace trace;
+        trace.status = provider.PickValueInArray({InputTrace::Status::TRACED, InputTrace::Status::TRACED, InputTrace::Status::NOT_RUN, InputTrace::Status::TOO_LARGE, InputTrace::Status::LOG_OVERFLOW});
+        trace.ledger = std::move(ledger);
+        const auto charge = ExecutedDataBytes(txin, script_pub_key, &trace, ranges, dcb.second);
+        const auto again = ExecutedDataBytes(txin, script_pub_key, &trace, ranges, dcb.second);
+        Assert(charge.bytes == again.bytes && charge.total == again.total);
+        Assert(!charge.untraceable);
+        if (charge.conservative) {
+            // Charged as if nothing was followed: at most the stack sources of the input.
+            Assert(charge.bytes <= TraceableInputBytes(txin));
+        } else if (!trace.ledger.runs.empty() && !trace.ledger.failed) {
+            // The accounting covers what the static rules count only for shapes they recognise, which a random
+            // script is not. What must hold for any script is that the part outside the static ranges is part of the whole.
+            Assert(charge.bytes <= charge.total);
+            if (ranges.counted.empty() && !ranges.whole_input) Assert(charge.bytes == charge.total);
+        }
+        return;
     }
     CheckLedger(tracer.Finish());
 }
