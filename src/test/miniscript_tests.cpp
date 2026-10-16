@@ -9,6 +9,9 @@
 #include <addresstype.h>
 #include <core_io.h>
 #include <hash.h>
+#include <policy/executed_data.h>
+#include <policy/policy.h>
+#include <policy/settings.h>
 #include <pubkey.h>
 #include <uint256.h>
 #include <crypto/ripemd160.h>
@@ -348,6 +351,44 @@ void SatisfactionToWitness(miniscript::MiniscriptContext ctx, CScriptWitness& wi
     witness.stack.push_back(*builder.GetSpendData().scripts.begin()->second.begin());
 }
 
+//! Honest spends that the executed-data accounting charges, by miniscript, for the summary test below.
+struct HonestCharge {
+    std::string ms;
+    size_t unproven;
+    size_t counted;
+    bool untraceable;
+};
+std::vector<HonestCharge> g_honest_charged;
+size_t g_honest_spends{0};
+
+/** What the mempool would count as datacarrier bytes for this honest spend of a miniscript: the policy script
+ *  check runs the scripts once with the recorder and the tracer watching, then the static rules and the
+ *  executed-data accounting each add their share. */
+void AccountHonestSpend(const std::string& ms, const CScript& script_pubkey, const CScriptWitness& witness, const BaseSignatureChecker& checker)
+{
+    VerifiedKeys keys;
+    SigCheckLog log;
+    ExecutedDataTracer tracer{&log};
+    const KeyRecordingSignatureChecker recorder{checker, keys, &log, &tracer};
+    ScriptError serror;
+    if (!VerifyScript(CScript(), script_pubkey, &witness, STANDARD_SCRIPT_VERIFY_FLAGS, recorder, &serror)) return;
+    CTxIn txin;
+    txin.scriptWitness = witness;
+    const CScript script{GetScriptForTransactionInput(script_pubkey, txin).first};
+    DatacarrierRanges ranges;
+    const auto dcb = script.DatacarrierBytes(0, &witness, /*dead_branches=*/::g_reject_dead_branches, &keys, /*reached_normal_return=*/nullptr, &ranges);
+    InputTrace trace;
+    trace.status = InputTrace::Status::TRACED;
+    trace.ledger = tracer.Finish();
+    const ExecutedDataCharge extra{ExecutedDataBytes(txin, script_pubkey, &trace, ranges, dcb.second)};
+    ++g_honest_spends;
+    // The static rules are the base's: #400 counts a part a constant guard makes unreachable, such as the
+    // second branch of andor(0,X,Y), whether or not this accounting runs. Only what it adds is recorded.
+    if (extra.bytes > 0 || extra.untraceable) {
+        g_honest_charged.push_back({ms, dcb.first + dcb.second, extra.bytes, extra.untraceable});
+    }
+}
+
 struct MiniScriptTest : BasicTestingSetup {
 /** Run random satisfaction tests. */
 void TestSatisfy(const KeyConverter& converter, const std::string& testcase, const NodeRef& node) {
@@ -393,6 +434,7 @@ void TestSatisfy(const KeyConverter& converter, const std::string& testcase, con
                 // Test non-malleable satisfaction.
                 ScriptError serror;
                 bool res = VerifyScript(CScript(), script_pubkey, &witness_nonmal, STANDARD_SCRIPT_VERIFY_FLAGS, checker, &serror);
+                if (res && node->IsSane()) AccountHonestSpend(testcase, script_pubkey, witness_nonmal, checker);
                 // Non-malleable satisfactions are guaranteed to be valid if ValidSatisfactions(), unless REDUCED_DATA rules are violated.
                 if (node->ValidSatisfactions()) {
                     BOOST_CHECK(res ||
@@ -748,6 +790,79 @@ BOOST_AUTO_TEST_CASE(fixed_tests)
     Test("thresh(1,c:pk_k(03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65),altv:after(1000000000),altv:after(100))", "?", "?", TESTMODE_VALID); // thresh with k = 1
 
     g_testdata.reset();
+}
+
+BOOST_FIXTURE_TEST_CASE(honest_miniscript_spends_pay_no_executed_data_charge, MiniScriptTest)
+{
+    // Runs after every other case of the suite has satisfied its miniscripts through the same checks.
+    // The executed-data accounting must add nothing to an honest satisfaction beyond what the static rules
+    // already count on the base (the unproven-key charge of wide multi_a, and #400's count of a branch a
+    // constant guard makes unreachable).
+    BOOST_CHECK_GT(g_honest_spends, 100U);
+    for (const auto& c : g_honest_charged) {
+        BOOST_CHECK_MESSAGE(c.counted == 0 && !c.untraceable, "static " << c.unproven << ", executed-data added " << c.counted << " " << c.ms);
+    }
+}
+
+namespace {
+//! A converter that needs no precomputed key data, for the scripts the functional test spends.
+struct SelfContainedConverter {
+    typedef CPubKey Key;
+    const miniscript::MiniscriptContext m_script_ctx{miniscript::MiniscriptContext::P2WSH};
+    bool KeyCompare(const Key& a, const Key& b) const { return a < b; }
+    std::vector<unsigned char> ToPKBytes(const CPubKey& key) const { return {key.begin(), key.end()}; }
+    std::vector<unsigned char> ToPKHBytes(const CPubKey& key) const
+    {
+        const auto hash = Hash160(key);
+        return {hash.begin(), hash.end()};
+    }
+    template <typename I>
+    std::optional<Key> FromString(I first, I last) const
+    {
+        const auto bytes = ParseHex(std::string(first, last));
+        Key key{bytes.begin(), bytes.end()};
+        if (key.IsValid()) return key;
+        return {};
+    }
+    template <typename I>
+    std::optional<Key> FromPKBytes(I first, I last) const { return std::nullopt; }
+    template <typename I>
+    std::optional<Key> FromPKHBytes(I first, I last) const { return std::nullopt; }
+    std::optional<std::string> ToString(const Key& key) const { return HexStr(ToPKBytes(key)); }
+    miniscript::MiniscriptContext MsContext() const { return m_script_ctx; }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(scripts_of_the_executed_data_functional_test)
+{
+    // The honest miniscript rows of test/functional/mempool_datacarrier_executed_data.py are spent from
+    // scripts made here, so that they come from the miniscript implementation and not from memory. K1 to K8
+    // are the keys of that test, H1 and H2 are SHA256 hashes and H3 a HASH160 of its preimages.
+    static const std::string K[] = {"",
+        "0335049a0ea93d68b915619cb80c3260f53cd17ceba0c7d332ea651a09298c7ca7", "02a36b67e00284494fd649fd7c5eb03d7e8bf933095857ac640ca2262bd1d678f2",
+        "024e94e6664a502077fa1d8a70d7a7a4e26957fb702cd7df752d313658a42d2745", "02dbbea9cf8350896daf74e047997a36951ca17f6875ad3dce9ada893abb15b486",
+        "032c12499e669f390968839f55b88c7d5700bcc7b32e13b0eb83f6136c2e454238", "03874624daf3754481eb3d621d1eb3d7423006472a7854cfae73a9da1d904f07cc",
+        "02324407e08f0f086113279908eadfbc023532f94c1afa0285276712b57f5441fb", "03f609d32a2cf86c8094571c326c29ed15da0e1ae258e9c2d6df71c0ba62317fa4"};
+    static const std::string H1{"83bb6fba4955e7cfa8e9c93880df580d293a5e04f6dbf024079fe0242f6e22c8"};
+    static const std::string H3{"4173c80a0436fcfe1e6826bf35a6cafda471e248"};
+    const struct {
+        std::string ms;
+        std::string script_hex;
+    } rows[] = {
+        {"or_d(pk(" + K[1] + "),and_v(v:pkh(" + K[2] + "),older(10)))", "210335049a0ea93d68b915619cb80c3260f53cd17ceba0c7d332ea651a09298c7ca7ac736476a91462a37f4df923ea2fdb5066239e9c6ef36dd293a988ad5ab268"},
+        {"andor(pk(" + K[1] + "),sha256(" + H1 + "),pk(" + K[2] + "))", "210335049a0ea93d68b915619cb80c3260f53cd17ceba0c7d332ea651a09298c7ca7ac642102a36b67e00284494fd649fd7c5eb03d7e8bf933095857ac640ca2262bd1d678f2ac6782012088a82083bb6fba4955e7cfa8e9c93880df580d293a5e04f6dbf024079fe0242f6e22c88768"},
+        {"or_d(pkh(" + K[3] + "),and_v(v:sha256(" + H1 + "),and_v(v:hash160(" + H3 + "),pk(" + K[2] + "))))", "76a914e2ef6705f4a1a536f9b47cb863aedb89fcb965c188ac736482012088a82083bb6fba4955e7cfa8e9c93880df580d293a5e04f6dbf024079fe0242f6e22c88882012088a9144173c80a0436fcfe1e6826bf35a6cafda471e248882102a36b67e00284494fd649fd7c5eb03d7e8bf933095857ac640ca2262bd1d678f2ac68"},
+        {"thresh(2,pk(" + K[1] + "),a:pkh(" + K[2] + "),a:pkh(" + K[3] + "),a:pkh(" + K[4] + "),a:pkh(" + K[5] + "),a:pkh(" + K[6] + "))", "210335049a0ea93d68b915619cb80c3260f53cd17ceba0c7d332ea651a09298c7ca7ac6b76a91462a37f4df923ea2fdb5066239e9c6ef36dd293a988ac6c936b76a914e2ef6705f4a1a536f9b47cb863aedb89fcb965c188ac6c936b76a914370f0b5e29b1b202897b5198bcfb5049a795411788ac6c936b76a914c9032d1155c557d015a5f8e443414c68e6df99e788ac6c936b76a914014cfbf386a4bdc517d6373cb19419bece989f0388ac6c935287"},
+        {"thresh(2,pk(" + K[1] + "),a:pkh(" + K[2] + "),a:pkh(" + K[3] + "),a:pkh(" + K[4] + "),a:pkh(" + K[5] + "),a:pkh(" + K[6] + "),a:pkh(" + K[7] + "),a:pkh(" + K[8] + "))", "210335049a0ea93d68b915619cb80c3260f53cd17ceba0c7d332ea651a09298c7ca7ac6b76a91462a37f4df923ea2fdb5066239e9c6ef36dd293a988ac6c936b76a914e2ef6705f4a1a536f9b47cb863aedb89fcb965c188ac6c936b76a914370f0b5e29b1b202897b5198bcfb5049a795411788ac6c936b76a914c9032d1155c557d015a5f8e443414c68e6df99e788ac6c936b76a914014cfbf386a4bdc517d6373cb19419bece989f0388ac6c936b76a9144ec255e3dee3f7adbfcfa2b058aa8f0d95bd9f2188ac6c936b76a914cf42b7ef36628b9431d4ac522de6f20be3fa865388ac6c935287"},
+        {"or_d(multi(3," + K[1] + "," + K[2] + "," + K[3] + "," + K[4] + "," + K[5] + "),and_v(v:multi(2," + K[1] + "," + K[2] + "," + K[3] + "),older(10)))", "53210335049a0ea93d68b915619cb80c3260f53cd17ceba0c7d332ea651a09298c7ca72102a36b67e00284494fd649fd7c5eb03d7e8bf933095857ac640ca2262bd1d678f221024e94e6664a502077fa1d8a70d7a7a4e26957fb702cd7df752d313658a42d27452102dbbea9cf8350896daf74e047997a36951ca17f6875ad3dce9ada893abb15b48621032c12499e669f390968839f55b88c7d5700bcc7b32e13b0eb83f6136c2e45423855ae736452210335049a0ea93d68b915619cb80c3260f53cd17ceba0c7d332ea651a09298c7ca72102a36b67e00284494fd649fd7c5eb03d7e8bf933095857ac640ca2262bd1d678f221024e94e6664a502077fa1d8a70d7a7a4e26957fb702cd7df752d313658a42d274553af5ab268"},
+    };
+    const SelfContainedConverter converter;
+    for (const auto& row : rows) {
+        const auto node = miniscript::FromString(row.ms, converter);
+        BOOST_REQUIRE_MESSAGE(node && node->IsValid() && node->IsValidTopLevel(), row.ms);
+        BOOST_TEST_MESSAGE("SCRIPT " << HexStr(node->ToScript(converter)));
+        if (row.script_hex != "?") BOOST_CHECK_EQUAL(HexStr(node->ToScript(converter)), row.script_hex);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

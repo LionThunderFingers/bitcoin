@@ -3,6 +3,8 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <addresstype.h>
+#include <coins.h>
+#include <consensus/amount.h>
 #include <core_io.h>
 #include <crypto/ripemd160.h>
 #include <crypto/sha256.h>
@@ -10,6 +12,7 @@
 #include <policy/executed_data.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
+#include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <test/util/random.h>
@@ -841,6 +844,68 @@ BOOST_AUTO_TEST_CASE(accounting_honest_spends_pay_nothing)
     BOOST_CHECK_EQUAL(ChargeSpend(CScript() << Sig() << pk, CScript() << OP_DUP << OP_HASH160 << Hash160(pk) << OP_EQUALVERIFY << OP_CHECKSIG, CScriptWitness()).extra.bytes, 0U);
 }
 
+BOOST_AUTO_TEST_CASE(accounting_does_not_depend_on_the_input_cache)
+{
+    // With traces given, the input cache of the static pass is neither filled nor read: the executed-data
+    // accounting needs the ranges of the full counting pass of every input. So the result is the same
+    // with no cache, an empty one, one a static pass filled, and one holding nonsense.
+    const CScript envelope = CScript() << OP_FALSE << OP_IF << Bytes(100, 3) << OP_ENDIF << Key(1) << OP_CHECKSIG;
+    const CScript dropping = CScript() << OP_DROP << Key(2) << OP_CHECKSIG;
+    const CScriptWitness envelope_witness{Wit({Sig()}, envelope)};
+    const CScriptWitness dropping_witness{Wit({Sig(), Bytes(80, 5)}, dropping)};
+    const CScript spks[] = {Wsh(envelope), Wsh(dropping)};
+    const CScriptWitness* witnesses[] = {&envelope_witness, &dropping_witness};
+
+    CCoinsView dummy;
+    CCoinsViewCache view{&dummy};
+    CMutableTransaction mtx;
+    std::vector<InputTrace> traces;
+    for (size_t i{0}; i < 2; ++i) {
+        const COutPoint prevout{Txid::FromUint256(uint256{static_cast<unsigned char>(i + 1)}), 0};
+        view.AddCoin(prevout, Coin{CTxOut{COIN, spks[i]}, 1, false}, true);
+        mtx.vin.emplace_back(prevout);
+        mtx.vin.back().scriptWitness = *witnesses[i];
+        const Traced t = TraceSpend(CScript(), spks[i], *witnesses[i]);
+        REQUIRE_TRACED(t);
+        InputTrace trace;
+        trace.status = InputTrace::Status::TRACED;
+        trace.ledger = t.ledger;
+        traces.push_back(std::move(trace));
+    }
+    mtx.vout.emplace_back(COIN, CScript() << OP_TRUE);
+    const CTransaction tx{mtx};
+
+    const std::vector<VerifiedKeys> verified{VerifiedKeys{Key(1)}, VerifiedKeys{Key(2)}};
+    const auto same = [](const std::vector<DatacarrierInputCache>& a, const std::vector<DatacarrierInputCache>& b) {
+        return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](const DatacarrierInputCache& x, const DatacarrierInputCache& y) {
+            return x.first == y.first && x.second == y.second && x.normal == y.normal;
+        });
+    };
+
+    std::vector<DatacarrierInputCache> filled;
+    const auto static_only{DatacarrierBytes(tx, view, /*verified_keys=*/nullptr, &filled)};
+    BOOST_REQUIRE_EQUAL(filled.size(), 2U);
+
+    for (const std::vector<VerifiedKeys>* keys : {static_cast<const std::vector<VerifiedKeys>*>(nullptr), &verified}) {
+        bool untraceable{false};
+        const auto baseline{DatacarrierBytes(tx, view, keys, /*input_cache=*/nullptr, &traces, &untraceable)};
+        BOOST_CHECK(!untraceable);
+        // Not vacuous: the dropped witness item is charged on top of the static count.
+        BOOST_CHECK_GT(baseline.second, static_only.second);
+
+        std::vector<DatacarrierInputCache> empty;
+        std::vector<DatacarrierInputCache> prefilled{filled};
+        std::vector<DatacarrierInputCache> nonsense(2, DatacarrierInputCache{9999, 9999, true});
+        for (std::vector<DatacarrierInputCache>* cache : {&empty, &prefilled, &nonsense}) {
+            const std::vector<DatacarrierInputCache> before{*cache};
+            bool untraceable_cached{false};
+            const auto with_cache{DatacarrierBytes(tx, view, keys, cache, &traces, &untraceable_cached)};
+            BOOST_CHECK(with_cache == baseline);
+            BOOST_CHECK_EQUAL(untraceable_cached, untraceable);
+            BOOST_CHECK(same(*cache, before)); // neither filled nor modified
+        }
+    }
+}
 // ---- the model must hold for every script -----------------------------------------------------
 
 BOOST_AUTO_TEST_CASE(random_scripts_never_break_the_model)
