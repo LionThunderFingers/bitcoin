@@ -154,7 +154,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        ValidationCache& validation_cache,
                        std::vector<CScriptCheck>* pvChecks = nullptr,
                        const std::vector<unsigned int>& flags_per_input = {},
-                       std::vector<VerifiedKeys>* verified_keys = nullptr)
+                       std::vector<VerifiedKeys>* verified_keys = nullptr,
+                       std::vector<SigCheckLog>* sig_check_logs = nullptr)
                        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& tx)
@@ -736,6 +737,8 @@ private:
         /** Per-input result of the pre-script static datacarrier count, so the post-script recount can
          *  reuse each input's dead-branch count and recompute only its unproven-pubkey part. */
         std::vector<DatacarrierInputCache> m_carrier_cache;
+        /** The signature checks of each input in the order they happened, sized like m_verified_keys. */
+        std::vector<SigCheckLog> m_sig_check_logs;
     };
 
     static inline bool MaybeReject_(TxValidationResult reason, const std::string& reason_str, const std::string& debug_msg, const ignore_rejects_type& ignore_rejects, TxValidationState& state) {
@@ -1576,7 +1579,7 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), nullptr, {}, recount ? &ws.m_verified_keys : nullptr)) {
+    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), nullptr, {}, recount ? &ws.m_verified_keys : nullptr, recount ? &ws.m_sig_check_logs : nullptr)) {
         // Detect a failure due to a missing witness so that p2p code can handle rejection caching appropriately.
         if (!tx.HasWitness() && SpendsNonAnchorWitnessProg(tx, m_view)) {
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
@@ -2565,7 +2568,7 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
     bool verified;
     if (m_verified_keys) {
         // Wraps the caching checker, so a signature-cache hit is observed like any other success.
-        verified = VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, KeyRecordingSignatureChecker(checker, *m_verified_keys), &error);
+        verified = VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, KeyRecordingSignatureChecker(checker, *m_verified_keys, m_sig_check_log), &error);
     } else {
         verified = VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, checker, &error);
     }
@@ -2618,6 +2621,7 @@ ValidationCache::ValidationCache(const size_t script_execution_cache_bytes, cons
  * is not consulted, so the scripts always run, and it is sized to one set per input, holding the public
  * keys a non-empty signature verified against. An input that verified no key gets an empty set. Storing
  * into the script execution cache is unchanged. It has no effect on the result.
+ * sig_check_logs, if also given, is sized alike and holds each input's signature checks in order.
  *
  * Non-static (and redeclared) in src/test/txvalidationcache_tests.cpp
  */
@@ -2627,10 +2631,12 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        ValidationCache& validation_cache,
                        std::vector<CScriptCheck>* pvChecks,
                        const std::vector<unsigned int>& flags_per_input,
-                       std::vector<VerifiedKeys>* verified_keys)
+                       std::vector<VerifiedKeys>* verified_keys,
+                       std::vector<SigCheckLog>* sig_check_logs)
 {
     // Cleared first, so that nothing stale survives and a set exists only for an input that ran below.
     if (verified_keys) verified_keys->clear();
+    if (sig_check_logs) sig_check_logs->clear();
 
     if (tx.IsCoinBase()) return true;
 
@@ -2674,6 +2680,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
 
     // Block validation queues its checks, and never records.
     if (verified_keys && !pvChecks) verified_keys->resize(tx.vin.size());
+    if (verified_keys && sig_check_logs && !pvChecks) sig_check_logs->resize(tx.vin.size());
 
     for (unsigned int i = 0; i < tx.vin.size(); i++) {
         if (!flags_per_input.empty()) flags = flags_per_input[i];
@@ -2686,7 +2693,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
 
         // Verify signature
         CScriptCheck check(txdata.m_spent_outputs[i], tx, validation_cache.m_signature_cache, i, flags, cacheSigStore, &txdata,
-                           (verified_keys && !pvChecks) ? &(*verified_keys)[i] : nullptr);
+                           (verified_keys && !pvChecks) ? &(*verified_keys)[i] : nullptr,
+                           (verified_keys && sig_check_logs && !pvChecks) ? &(*sig_check_logs)[i] : nullptr);
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
         } else if (auto result = check(); result.has_value()) {

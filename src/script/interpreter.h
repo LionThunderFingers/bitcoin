@@ -511,6 +511,27 @@ public:
     }
 };
 
+/** One call the interpreter made to the signature checker. */
+struct SigCheckCall {
+    std::vector<unsigned char> sig;
+    std::vector<unsigned char> key;
+    //! What the checker answered.
+    bool ok;
+};
+
+/**
+ * Every signature check one input made, in the order it made them. A CHECKSIG makes at most one
+ * call and a CHECKMULTISIG one per signature-and-key pair it tries; an empty signature in a
+ * pre-tapscript script is still a call, and answers false.
+ */
+struct SigCheckLog {
+    //! Calls kept per input. A script that makes more than this is not followed any further.
+    static constexpr size_t MAX_CALLS{4096};
+    std::vector<SigCheckCall> calls;
+    //! Set once MAX_CALLS was exceeded. The log is then incomplete and must not be relied on.
+    bool overflow{false};
+};
+
 /**
  * Observes which public keys a non-empty signature verified against, and changes nothing else.
  *
@@ -520,12 +541,17 @@ public:
  * outermost checker, so a signature-cache hit in the one beneath still records. The signature hash
  * rules are passed on as given, so a signature accepted under either set of rules is recorded.
  *
+ * If given a log it also keeps every call, accepted or not, in order. If given an observer it is
+ * the one the interpreter finds through GetObserver().
+ *
  * For policy use only. Consensus code must never be handed one: it has no effect on validity, but
  * there is nothing for it to do there either.
  */
 class KeyRecordingSignatureChecker : public DeferringSignatureChecker
 {
     VerifiedKeys& m_keys;
+    SigCheckLog* const m_log;
+    ScriptObserver* const m_observer;
 
     void Record(Span<const unsigned char> key) const
     {
@@ -533,12 +559,25 @@ class KeyRecordingSignatureChecker : public DeferringSignatureChecker
         if (m_keys.size() < MAX_PUBKEYS_PER_MULTI_A) m_keys.emplace(key.begin(), key.end());
     }
 
+    void Log(Span<const unsigned char> sig, Span<const unsigned char> key, bool ok) const
+    {
+        if (!m_log || m_log->overflow) return;
+        if (m_log->calls.size() >= SigCheckLog::MAX_CALLS) {
+            m_log->overflow = true;
+            return;
+        }
+        m_log->calls.push_back(SigCheckCall{std::vector<unsigned char>(sig.begin(), sig.end()), std::vector<unsigned char>(key.begin(), key.end()), ok});
+    }
+
 public:
-    KeyRecordingSignatureChecker(const BaseSignatureChecker& checker, VerifiedKeys& keys) : DeferringSignatureChecker(checker), m_keys(keys) {}
+    KeyRecordingSignatureChecker(const BaseSignatureChecker& checker, VerifiedKeys& keys, SigCheckLog* log = nullptr, ScriptObserver* observer = nullptr) : DeferringSignatureChecker(checker), m_keys(keys), m_log(log), m_observer(observer) {}
+
+    ScriptObserver* GetObserver() const override { return m_observer; }
 
     bool CheckECDSASignature(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion, SighashRules sighash_rules = SighashRules::LEGACY) const override
     {
         const bool ok{DeferringSignatureChecker::CheckECDSASignature(scriptSig, vchPubKey, scriptCode, sigversion, sighash_rules)};
+        Log(scriptSig, vchPubKey, ok);
         if (ok) Record(vchPubKey);
         return ok;
     }
@@ -546,6 +585,7 @@ public:
     bool CheckSchnorrSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr, SighashRules sighash_rules = SighashRules::LEGACY) const override
     {
         const bool ok{DeferringSignatureChecker::CheckSchnorrSignature(sig, pubkey, sigversion, execdata, serror, sighash_rules)};
+        Log(sig, pubkey, ok);
         if (ok) Record(pubkey);
         return ok;
     }

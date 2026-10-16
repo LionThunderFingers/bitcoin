@@ -28,7 +28,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        ValidationCache& validation_cache,
                        std::vector<CScriptCheck>* pvChecks,
                        const std::vector<unsigned int>& flags_per_input = {},
-                       std::vector<VerifiedKeys>* verified_keys = nullptr
+                       std::vector<VerifiedKeys>* verified_keys = nullptr,
+                       std::vector<SigCheckLog>* sig_check_logs = nullptr
 ) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 BOOST_AUTO_TEST_SUITE(txvalidationcache_tests)
@@ -505,6 +506,21 @@ BOOST_FIXTURE_TEST_CASE(checkinputs_records_verified_keys, TestChain100Setup)
         BOOST_CHECK(keys[0].count(key_bytes));
     }
 
+    // The ordered log sits next to the keys: one call, answered true, with the signature and key that were checked.
+    {
+        TxValidationState state;
+        PrecomputedTransactionData txdata;
+        std::vector<VerifiedKeys> keys;
+        std::vector<SigCheckLog> logs{SigCheckLog{{SigCheckCall{{1}, {2}, false}}, true}};  // stale content must not survive
+        BOOST_CHECK(CheckInputScripts(tx, state, &coins, flags, true, false, txdata, cache, nullptr, {}, &keys, &logs));
+        BOOST_REQUIRE_EQUAL(logs.size(), 1U);
+        BOOST_CHECK(!logs[0].overflow);
+        BOOST_REQUIRE_EQUAL(logs[0].calls.size(), 1U);
+        BOOST_CHECK(logs[0].calls[0].ok);
+        BOOST_CHECK(logs[0].calls[0].sig == sig);
+        BOOST_CHECK(logs[0].calls[0].key == key_bytes);
+    }
+
     // Queued checks are block validation's, which never records.
     {
         TxValidationState state;
@@ -514,6 +530,9 @@ BOOST_FIXTURE_TEST_CASE(checkinputs_records_verified_keys, TestChain100Setup)
         BOOST_CHECK(CheckInputScripts(tx, state, &coins, flags, true, false, txdata, cache, &checks, {}, &keys));
         BOOST_CHECK_EQUAL(checks.size(), 1U);
         BOOST_CHECK(keys.empty());
+        std::vector<SigCheckLog> logs;
+        BOOST_CHECK(CheckInputScripts(tx, state, &coins, flags, true, false, txdata, cache, &checks, {}, &keys, &logs));
+        BOOST_CHECK(logs.empty());
     }
 
     // Once the script execution cache has it, a check that records still runs the scripts and records,
@@ -537,9 +556,13 @@ BOOST_FIXTURE_TEST_CASE(checkinputs_records_verified_keys, TestChain100Setup)
         PrecomputedTransactionData txdata;
         // stale content must not survive
         std::vector<VerifiedKeys> keys{VerifiedKeys{std::vector<unsigned char>(33, 2)}, VerifiedKeys{}};
-        BOOST_CHECK(CheckInputScripts(tx, state, &coins, flags, true, cache_full_script_store, txdata, cache, nullptr, {}, &keys));
+        std::vector<SigCheckLog> logs(2);
+        BOOST_CHECK(CheckInputScripts(tx, state, &coins, flags, true, cache_full_script_store, txdata, cache, nullptr, {}, &keys, &logs));
         BOOST_REQUIRE_EQUAL(keys.size(), 1U);
         BOOST_CHECK(keys[0] == VerifiedKeys{key_bytes});
+        BOOST_REQUIRE_EQUAL(logs.size(), 1U);
+        BOOST_REQUIRE_EQUAL(logs[0].calls.size(), 1U);
+        BOOST_CHECK(logs[0].calls[0].key == key_bytes);
         BOOST_CHECK_EQUAL(queued_without_recorder(), 0U);
     }
 

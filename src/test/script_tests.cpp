@@ -2500,6 +2500,61 @@ BOOST_AUTO_TEST_CASE(key_recording_signature_checker)
     }
 }
 
+BOOST_AUTO_TEST_CASE(key_recording_signature_checker_log)
+{
+    const std::vector<unsigned char> sig(72, 1), key(33, 2), xonly(32, 3);
+    const CScript code;
+    ScriptExecutionData execdata;
+    for (const bool answer : {true, false}) {
+        FixedAnswerChecker inner{answer};
+        VerifiedKeys keys;
+        SigCheckLog log;
+        KeyRecordingSignatureChecker recorder{inner, keys, &log};
+        // The log has every call in order, whatever the answer, and answers still pass through.
+        BOOST_CHECK_EQUAL(answer, recorder.CheckECDSASignature(sig, key, code, SigVersion::WITNESS_V0));
+        BOOST_CHECK_EQUAL(answer, recorder.CheckSchnorrSignature(sig, xonly, SigVersion::TAPSCRIPT, execdata));
+        BOOST_CHECK_EQUAL(answer, recorder.CheckECDSASignature({}, key, code, SigVersion::BASE));
+        BOOST_REQUIRE_EQUAL(log.calls.size(), 3U);
+        BOOST_CHECK(log.calls[0].sig == sig && log.calls[0].key == key && log.calls[0].ok == answer);
+        BOOST_CHECK(log.calls[1].sig == sig && log.calls[1].key == xonly && log.calls[1].ok == answer);
+        BOOST_CHECK(log.calls[2].sig.empty() && log.calls[2].key == key);
+        BOOST_CHECK(!log.overflow);
+        BOOST_CHECK_EQUAL(keys.size(), answer ? 2U : 0U);
+        // No observer unless one is given.
+        BOOST_CHECK(recorder.GetObserver() == nullptr);
+    }
+
+    // Past MAX_CALLS the log stops and says so; answers and the key set are unaffected.
+    FixedAnswerChecker inner{true};
+    VerifiedKeys keys;
+    SigCheckLog log;
+    KeyRecordingSignatureChecker recorder{inner, keys, &log};
+    for (size_t i{0}; i < SigCheckLog::MAX_CALLS + 5; ++i) {
+        BOOST_CHECK(recorder.CheckECDSASignature(sig, key, code, SigVersion::WITNESS_V0));
+    }
+    BOOST_CHECK_EQUAL(log.calls.size(), SigCheckLog::MAX_CALLS);
+    BOOST_CHECK(log.overflow);
+    BOOST_CHECK_EQUAL(keys.size(), 1U);
+
+    // Without a log, nothing is kept.
+    VerifiedKeys keys2;
+    KeyRecordingSignatureChecker no_log{inner, keys2};
+    BOOST_CHECK(no_log.CheckECDSASignature(sig, key, code, SigVersion::WITNESS_V0));
+}
+
+BOOST_AUTO_TEST_CASE(key_recording_signature_checker_hands_out_observer)
+{
+    FixedAnswerChecker inner{true};
+    VerifiedKeys keys;
+    test::CountingScriptObserver observer;
+    const KeyRecordingSignatureChecker recorder{inner, keys, nullptr, &observer};
+    BOOST_CHECK(recorder.GetObserver() == &observer);
+    std::vector<std::vector<unsigned char>> stack;
+    BOOST_CHECK(EvalScript(stack, CScript() << OP_1 << OP_DUP << OP_DROP, SCRIPT_VERIFY_NONE, recorder, SigVersion::BASE));
+    BOOST_CHECK_EQUAL(observer.ops, 3U);
+    BOOST_CHECK(observer.contract_ok);
+}
+
 BOOST_AUTO_TEST_CASE(script_GetScriptForTransactionInput)
 {
     using zeros = std::vector<unsigned char>;

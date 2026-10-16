@@ -365,10 +365,12 @@ private:
     SignatureCache* m_signature_cache;
     /** Where to note the keys a signature verified against, or nullptr to note nothing. Policy checks only. */
     VerifiedKeys* m_verified_keys;
+    /** Where to keep the ordered signature checks, or nullptr to keep none. Only used together with m_verified_keys. */
+    SigCheckLog* m_sig_check_log;
 
 public:
-    CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, SignatureCache& signature_cache, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn, PrecomputedTransactionData* txdataIn, VerifiedKeys* verified_keys = nullptr) :
-        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn), m_signature_cache(&signature_cache), m_verified_keys(verified_keys) { }
+    CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, SignatureCache& signature_cache, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn, PrecomputedTransactionData* txdataIn, VerifiedKeys* verified_keys = nullptr, SigCheckLog* sig_check_log = nullptr) :
+        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn), m_signature_cache(&signature_cache), m_verified_keys(verified_keys), m_sig_check_log(sig_check_log) { }
 
     CScriptCheck(const CScriptCheck&) = delete;
     CScriptCheck& operator=(const CScriptCheck&) = delete;
