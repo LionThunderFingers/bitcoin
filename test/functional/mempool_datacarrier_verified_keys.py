@@ -35,6 +35,7 @@ from test_framework.messages import (
 )
 from test_framework.script import (
     CScript,
+    MAX_SCRIPT_ELEMENT_SIZE,
     OP_0NOTEQUAL,
     OP_1,
     OP_2DROP,
@@ -61,6 +62,7 @@ from test_framework.script import (
     OP_SWAP,
     OP_TRUE,
     SIGHASH_ALL,
+    LegacySignatureHash,
     SegwitV0SignatureHash,
     TaprootSignatureHash,
     hash160,
@@ -69,6 +71,7 @@ from test_framework.script import (
 from test_framework.script_util import (
     key_to_p2wpkh_script,
     keyhash_to_p2pkh_script,
+    script_to_p2sh_script,
     script_to_p2wsh_script,
 )
 from test_framework.test_framework import BitcoinTestFramework
@@ -99,9 +102,9 @@ class VerifiedKeyCreditTest(BitcoinTestFramework):
 
     # ---- building blocks ----
 
-    def newkey(self):
+    def newkey(self, compressed=True):
         k = ECKey()
-        k.generate()
+        k.generate(compressed)
         return k
 
     @staticmethod
@@ -126,7 +129,8 @@ class VerifiedKeyCreditTest(BitcoinTestFramework):
         """Fund every spec that has no outpoint of its own and return an unmined tx spending all of them.
 
         A spec is a dict with 'spk', 'stack' (a function of the tx and the input index that gives the
-        witness), and optionally 'sequence', 'outpoint' and 'value' for an output that already exists.
+        witness) or 'script_sig' (the same, giving the scriptSig of a legacy input), and optionally
+        'sequence', 'outpoint' and 'value' for an output that already exists.
         """
         outpoints = [s['outpoint'] if 'outpoint' in s else self.fund(s['spk']) for s in specs]
         if any('outpoint' not in s for s in specs):
@@ -139,6 +143,9 @@ class VerifiedKeyCreditTest(BitcoinTestFramework):
         tx.vout = [CTxOut(total - (10_000 * len(specs) if fee is None else fee), script_to_p2wsh_script(CScript([OP_TRUE])))]
         tx.wit.vtxinwit = [CTxInWitness() for _ in specs]
         for i, s in enumerate(specs):
+            if 'script_sig' in s:
+                tx.vin[i].scriptSig = s['script_sig'](tx, i)
+                continue
             stack = s['stack'](tx, i)
             # Every spend must fit the witness limit of a default node, so that nothing but the
             # datacarrier rules can be what refuses it there.
@@ -152,6 +159,14 @@ class VerifiedKeyCreditTest(BitcoinTestFramework):
 
     def spend_p2wsh(self, script, stack, sequence=0xffffffff, locktime=0):
         return self.spend_many([self.p2wsh_spec(script, stack, sequence)], locktime=locktime)
+
+    def p2sh_sig(self, key, script, tx, i):
+        return key.sign_ecdsa(LegacySignatureHash(script, tx, i, SIGHASH_ALL)[0]) + bytes([SIGHASH_ALL])
+
+    def p2sh_spec(self, redeem, items, sequence=0xffffffff):
+        """A legacy P2SH input. items(tx, i) gives the scriptSig pushes that go before the redeem script."""
+        assert len(redeem) <= MAX_SCRIPT_ELEMENT_SIZE, f"redeem script is {len(redeem)} bytes"
+        return {'spk': script_to_p2sh_script(redeem), 'script_sig': lambda tx, i: CScript(items(tx, i) + [bytes(redeem)]), 'sequence': sequence}
 
     def accept(self, node, tx):
         return node.testmempoolaccept([tx.serialize().hex()])[0]
@@ -374,6 +389,63 @@ class VerifiedKeyCreditTest(BitcoinTestFramework):
         # gives this P2WSH recovery-branch spend
         self.assert_charge(tx, charge_for(16), "11-of-15 / recovery 2-of-3, spent via recovery")
 
+    # ---- legacy P2SH, where an honest spend leaves real keys unsigned ----
+
+    def multisig_p2sh_spec(self, m, keys):
+        script = CScript([m] + [self.pub(k) for k in keys] + [len(keys), OP_CHECKMULTISIG])
+        return self.p2sh_spec(script, lambda tx, i: [b''] + [self.p2sh_sig(k, script, tx, i) for k in keys[:m]])
+
+    def two_branch_p2sh_spec(self, m, n, branch):
+        """IF <m-of-n> ELSE 1 CSV DROP <m-of-n> ENDIF, spent through one branch by its first m keys."""
+        now, later = [self.newkey() for _ in range(n)], [self.newkey() for _ in range(n)]
+        script = CScript([OP_IF, m] + [self.pub(k) for k in now] + [n, OP_CHECKMULTISIG, OP_ELSE, 1, OP_CHECKSEQUENCEVERIFY, OP_DROP,
+                                                                    m] + [self.pub(k) for k in later] + [n, OP_CHECKMULTISIG, OP_ENDIF])
+        signers, selector, sequence = (now, 1, 0xffffffff) if branch == 'IF' else (later, 0, 1)
+        return self.p2sh_spec(script, lambda tx, i: [b''] + [self.p2sh_sig(k, script, tx, i) for k in signers[:m]] + [selector], sequence)
+
+    def legacy_p2sh(self):
+        """Honest legacy P2SH multisig that leaves real keys unsigned. Pins the cost, does not judge it.
+
+        A P2SH spend carries its signatures in the scriptSig, which the static count does not see, so it
+        credits every threshold the script names, in every branch, and counts an uncompressed key as 33
+        bytes. The recount credits only the keys that signed and charges every other key by its length
+        beyond the allowance of 330 bytes per input, so these spends now pay for the keys they leave
+        unsigned. The charges add up across inputs, and spending one input per transaction keeps each
+        at its one-input charge.
+        """
+        uncompressed = lambda: [self.newkey(compressed=False) for _ in range(7)]
+        # 1-of-7 of real uncompressed keys (465 byte redeem script), one signing: six unsigned keys of
+        # 65 bytes are 390 bytes, 60 over the allowance. The static count charges nothing.
+        what = "legacy P2SH 1-of-7, uncompressed keys"
+        self.assert_charge(self.spend_many([self.multisig_p2sh_spec(1, uncompressed())]), 60, f"{what}, one input")
+        tx = self.spend_many([self.multisig_p2sh_spec(1, uncompressed()) for _ in range(2)])
+        self.assert_charge(tx, 120, f"{what}, two inputs (refused at the default limit)")
+        self.assert_accepted_without_fullcount(tx, f"{what}, two inputs")
+        # The same with compressed keys (241 bytes): six unsigned keys are 198 bytes, inside the allowance.
+        compressed = lambda: [self.newkey() for _ in range(7)]
+        what = "legacy P2SH 1-of-7, compressed keys"
+        self.assert_charge(self.spend_many([self.multisig_p2sh_spec(1, compressed())]), 0, f"{what}, one input")
+        self.assert_charge(self.spend_many([self.multisig_p2sh_spec(1, compressed()) for _ in range(2)]), 0, f"{what}, two inputs")
+
+        # Two branches of seven compressed keys (488 bytes). The branch not taken never signs.
+        # 1-of-7 either way: 13 unsigned keys are 429 bytes, 99 over, so even one input is refused.
+        # The static count credits both thresholds and charges 66.
+        for branch in ('IF', 'ELSE'):
+            self.assert_charge(self.spend_many([self.two_branch_p2sh_spec(1, 7, branch)]), 99,
+                               f"legacy P2SH IF 1-of-7 ELSE CSV 1-of-7, {branch} branch, one input (refused)")
+        # 2-of-7 either way: 12 unsigned keys are 396 bytes, 66 over. The static count charges nothing.
+        for branch in ('IF', 'ELSE'):
+            self.assert_charge(self.spend_many([self.two_branch_p2sh_spec(2, 7, branch)]), 66,
+                               f"legacy P2SH IF 2-of-7 ELSE CSV 2-of-7, {branch} branch, one input")
+        self.assert_charge(self.spend_many([self.two_branch_p2sh_spec(2, 7, branch) for branch in ('IF', 'ELSE')]), 132,
+                           "legacy P2SH IF 2-of-7 ELSE CSV 2-of-7, two inputs (refused)")
+        # 2-of-3 either way (216 bytes), a small vault: four unsigned keys, inside the allowance.
+        for branch in ('IF', 'ELSE'):
+            self.assert_charge(self.spend_many([self.two_branch_p2sh_spec(2, 3, branch)]), 0,
+                               f"legacy P2SH IF 2-of-3 ELSE CSV 2-of-3, {branch} branch")
+        self.assert_charge(self.spend_many([self.two_branch_p2sh_spec(2, 3, branch) for branch in ('IF', 'ELSE')]), 0,
+                           "legacy P2SH IF 2-of-3 ELSE CSV 2-of-3, two inputs")
+
     def same_key(self):
         k = self.newkey()
         pk = self.pub(k)
@@ -572,6 +644,9 @@ class VerifiedKeyCreditTest(BitcoinTestFramework):
 
         self.log.info("Recovery path")
         self.recovery()
+
+        self.log.info("Legacy P2SH spends that leave keys unsigned")
+        self.legacy_p2sh()
 
         self.log.info("Several inputs")
         self.multi_input()
