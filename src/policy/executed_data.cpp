@@ -8,6 +8,7 @@
 #include <serialize.h>
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <utility>
 
@@ -19,14 +20,24 @@ struct ModelError {
     std::string what;
 };
 
+//! A cheap fingerprint of a stack element, for the tracer to check its model against the interpreter with.
+//! It reads eight bytes per step: the tracer calls it for every op of every input of a transaction it has not
+//! accepted yet. It is not a security hash, a collision only hides a model error that the length and the
+//! other elements would very likely show too.
 uint64_t HashBytes(const valtype& v)
 {
-    uint64_t h{0xcbf29ce484222325ULL};
-    for (unsigned char c : v) {
-        h ^= c;
-        h *= 0x100000001b3ULL;
+    uint64_t h{0xcbf29ce484222325ULL ^ v.size()};
+    size_t i{0};
+    for (; i + 8 <= v.size(); i += 8) {
+        uint64_t w;
+        std::memcpy(&w, v.data() + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 32;
     }
-    return h;
+    for (; i < v.size(); ++i) {
+        h = (h ^ v[i]) * 0x100000001b3ULL;
+    }
+    return h ^ (h >> 29);
 }
 
 //! Little endian sign-and-magnitude, as CScriptNum reads it. False if too long to be a count.
@@ -394,12 +405,19 @@ void ExecutedDataTracer::BeforeOp(opcodetype opcode, size_t start, size_t end, c
     m_calls_mark = m_calls ? m_calls->calls.size() : 0;
     m_pre_ok = false;
     m_window = 8;
+    m_roll_slot = SIZE_MAX;
     if (exec) {
         try {
             m_runs.back().executed.push_back(static_cast<uint32_t>(start));
             if ((opcode == OP_PICK || opcode == OP_ROLL) && !stack.empty()) {
                 m_pre_ok = DecodeNum(stack.back(), m_pre_n) && m_pre_n >= 0 && m_pre_n < 1000;
-                if (m_pre_ok) m_window = static_cast<size_t>(m_pre_n) + 4;
+                // The elements between the top and the one that moves are not touched, whatever their number:
+                // hashing them all for every op made a deep OP_ROLL cost the stack, and a script may roll
+                // hundreds of times. Check the top and the slot the rolled element left, and the whole stack
+                // at the end of the run.
+                if (m_pre_ok && opcode == OP_ROLL && static_cast<size_t>(m_pre_n) + 2 <= stack.size()) {
+                    m_roll_slot = stack.size() - 2 - static_cast<size_t>(m_pre_n);
+                }
             } else if ((opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY) && !stack.empty()) {
                 m_pre_ok = DecodeNum(stack.back(), m_pre_n) && m_pre_n >= 0 && m_pre_n <= MAX_PUBKEYS_PER_MULTISIG &&
                            stack.size() >= static_cast<size_t>(m_pre_n) + 2 &&
@@ -421,6 +439,11 @@ void ExecutedDataTracer::AfterOp(const Real& stack, const Real& altstack)
             throw ModelError{"depth mismatch after " + GetOpName(m_op)};
         }
         Verify(m_stack, stack, m_window, GetOpName(m_op).c_str());
+        if (m_roll_slot < stack.size() && m_roll_slot < m_stack.size()) {
+            if (m_stack[m_roll_slot].len != stack[m_roll_slot].size() || m_stack[m_roll_slot].hash != HashBytes(stack[m_roll_slot])) {
+                throw ModelError{"value mismatch after OP_ROLL"};
+            }
+        }
         if (!m_alt.empty()) {
             const Elem& top{m_alt.back()};
             if (top.len != altstack.back().size() || top.hash != HashBytes(altstack.back())) throw ModelError{"altstack value mismatch"};

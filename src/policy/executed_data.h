@@ -250,6 +250,7 @@ private:
     int64_t m_pre_m{0};  //!< CHECKMULTISIG signature count
     bool m_pre_ok{false};
     size_t m_window{8};
+    size_t m_roll_slot{SIZE_MAX}; //!< the slot an OP_ROLL took its element from, to be checked after the op
 };
 
 /** What the policy script check could tell about one input. */
