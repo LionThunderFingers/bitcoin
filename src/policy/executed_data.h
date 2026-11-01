@@ -102,6 +102,12 @@ public:
     //! Total bytes of small-value credit (counts, lock times, depths, raw conditions, numeric
     //! operands) one input may use. Calibrate on the corpus.
     static constexpr uint32_t SMALL_CREDIT_BUDGET{64};
+    //! Bytes of minimal small numbers (up to 5 bytes) that code which never ran may hold for free in one input.
+    //! Beyond it they are charged: a 5 byte number carries almost 5 bytes of payload.
+    static constexpr uint32_t UNTAKEN_NUMBER_BUDGET{16};
+    //! Bytes of non-push, non-flow opcodes that code which never ran may hold for free in one input. An honest
+    //! untaken branch is a few dozen opcodes; the 201 opcode limit caps the rest at about 190 bytes.
+    static constexpr uint32_t UNTAKEN_OPCODE_BUDGET{80};
     //! Signature-check calls and logged sources the tracer is willing to follow.
     static constexpr size_t MAX_SOURCES{20000};
 

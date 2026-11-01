@@ -59,6 +59,7 @@ from test_framework.script import (
     OP_DUP,
     OP_ELSE,
     OP_ENDIF,
+    OP_NOP,
     OP_EQUAL,
     OP_EQUALVERIFY,
     OP_GREATERTHANOREQUAL,
@@ -396,6 +397,23 @@ class ExecutedDataTest(BitcoinTestFramework):
         script = CScript(sum([[OP_SHA256, sha256(p), OP_EQUALVERIFY] for p in pres], [])
                          + [OP_IF] + sum([[OP_SHA256, h, OP_EQUALVERIFY] for h in hs], []) + [OP_ENDIF, pub, OP_CHECKSIG])
         self.check(self.spend(script, lambda tx, i: [self.p2wsh_sig(K, script, tx, i), b''] + pres[::-1]), 33, "2 executed and 2 untaken hash locks")
+
+        # Minimal numbers of 5 bytes in a branch that does not run carry ~4.9 bytes of payload each. Three are
+        # inside the untaken-number budget (16 bytes), every further one is charged in full (push opcode and 5).
+        def num5():
+            return randbytes(4) + bytes([1 + randbytes(1)[0] % 0x7f])
+        for n, charge in ((3, 0), (4, 6), (10, 42), (254, None)):
+            nums = [num5() for _ in range(n)]
+            script = CScript([OP_IF] + nums + [OP_ENDIF, pub, OP_CHECKSIG])
+            self.check(self.spend(script, lambda tx, i: [self.p2wsh_sig(K, script, tx, i), b'']), charge, f"{n} untaken 5-byte numbers")
+        # The original shape: the key check runs, the numbers sit in the ELSE.
+        nums = [num5() for _ in range(254)]
+        script = CScript([OP_IF, pub, OP_CHECKSIG, OP_ELSE] + nums + [OP_ENDIF])
+        self.check(self.spend(script, lambda tx, i: [self.p2wsh_sig(K, script, tx, i), b'\x01']), None, "254 untaken 5-byte numbers in the ELSE of IF <pk> CHECKSIG")
+        # Opcodes that do not run name a byte each: 80 are free, the rest are charged.
+        for n, charge in ((80, 0), (81, 1), (190, None)):
+            script = CScript([OP_IF] + [OP_NOP] * n + [OP_ENDIF, pub, OP_CHECKSIG])
+            self.check(self.spend(script, lambda tx, i: [self.p2wsh_sig(K, script, tx, i), b'']), charge, f"{n} untaken opcode bytes")
 
         # A data source of exactly the remaining limit against one over: <x> NIP leaves x as the final
         # top, which uses one byte of it.

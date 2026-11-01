@@ -752,6 +752,34 @@ BOOST_AUTO_TEST_CASE(accounting_untaken_keys_and_numbers_are_free)
     BOOST_CHECK_EQUAL(c.extra.bytes, 0U);
 }
 
+BOOST_AUTO_TEST_CASE(accounting_untaken_small_numbers_are_budgeted)
+{
+    // Minimal numbers of 5 bytes carry almost 5 bytes of payload each, so code that never ran may hold only a
+    // small budget of them for free (UNTAKEN_NUMBER_BUDGET, 16 bytes): three, and the fourth is charged in full.
+    for (const int count : {3, 4, 254}) {
+        CScript script = CScript() << OP_IF;
+        for (int i = 0; i < count; ++i) script << Bytes(5, static_cast<unsigned char>(1 + i % 100));
+        script << OP_ENDIF << Key(1) << OP_CHECKSIG;
+        const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
+        BOOST_CHECK_EQUAL(c.extra.bytes, count <= 3 ? 0U : static_cast<uint64_t>(count - 3) * 6U);
+    }
+    // Numbers of 6 bytes were never free: the static rules count them, so nothing is left for the accounting.
+    const CScript six = CScript() << OP_IF << Bytes(6, 1) << OP_DROP << OP_ENDIF << Key(1) << OP_CHECKSIG;
+    BOOST_CHECK_EQUAL(ChargeSpend(CScript(), Wsh(six), Wit({Sig(), {}}, six)).extra.bytes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_untaken_opcode_bytes_are_budgeted)
+{
+    // Opcodes that never ran name a byte each. 80 are free (UNTAKEN_OPCODE_BUDGET), the rest are charged.
+    for (const int count : {80, 81, 190}) {
+        CScript script = CScript() << OP_IF;
+        for (int i = 0; i < count; ++i) script << OP_NOP;
+        script << OP_ENDIF << Key(1) << OP_CHECKSIG;
+        const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
+        BOOST_CHECK_EQUAL(c.extra.bytes, count <= 80 ? 0U : static_cast<uint64_t>(count - 80));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(accounting_not_followed_is_charged_conservatively)
 {
     // A preimage and a signature: the signature-shaped item is free, the preimage is data.

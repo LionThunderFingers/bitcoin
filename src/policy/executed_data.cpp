@@ -1051,6 +1051,8 @@ ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_scr
     // The pushes in code that never ran.
     uint32_t slots_left{l.lock_slots_left};
     uint32_t key_slots_left{l.key_lock_slots_left};
+    uint32_t number_bytes_left{ExecutedDataTracer::UNTAKEN_NUMBER_BUDGET};
+    uint32_t opcode_bytes_left{ExecutedDataTracer::UNTAKEN_OPCODE_BUDGET};
     for (size_t r = 0; r < l.runs.size(); ++r) {
         const auto& run{l.runs[r]};
         if (run.kind != ScriptRunKind::REDEEMSCRIPT && run.kind != ScriptRunKind::WITNESS_V0_SCRIPT && run.kind != ScriptRunKind::TAPSCRIPT) continue;
@@ -1089,15 +1091,30 @@ ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_scr
             const ScriptOp& op{ops[i]};
             if (std::binary_search(run.executed.begin(), run.executed.end(), static_cast<uint32_t>(op.begin))) continue;
             const bool broken{op.opcode == OP_INVALIDOPCODE};
-            if (!broken && (op.opcode > OP_PUSHDATA4 || op.data.empty())) continue; // not a push, or an empty one
             const uint64_t bytes{op.end - op.begin};
+            if (!broken && (op.opcode > OP_PUSHDATA4 || op.data.empty())) {
+                // Not a push, or an empty one. The opcodes of a branch that never ran are not free: a run of them
+                // names a byte each. Flow control is structure, not payload. An honest branch fits the allowance.
+                const bool flow{op.opcode == OP_IF || op.opcode == OP_NOTIF || op.opcode == OP_ELSE || op.opcode == OP_ENDIF};
+                if (flow) continue;
+                if (opcode_bytes_left >= bytes) {
+                    opcode_bytes_left -= static_cast<uint32_t>(bytes);
+                    continue;
+                }
+                total += bytes;
+                if (!counted_by_static(static_cast<uint32_t>(r), static_cast<uint32_t>(op.begin))) outside += bytes;
+                continue;
+            }
             bool data{true};
             if (!broken) {
                 const opcodetype next{i + 1 < ops.size() ? ops[i + 1].opcode : OP_INVALIDOPCODE};
                 const size_t n{op.data.size()};
                 if (n == 33 || n == 65 || (n == 32 && (next == OP_CHECKSIG || next == OP_CHECKSIGVERIFY || next == OP_CHECKSIGADD))) {
                     data = false; // a key: the unproven-key budget owns it
-                } else if (IsFreeNumber(op.data)) {
+                } else if (IsFreeNumber(op.data) && number_bytes_left >= n) {
+                    // A minimal number of up to 5 bytes carries almost its length in free-form payload, so the
+                    // untaken ones are free only up to a small budget, like the executed small values.
+                    number_bytes_left -= static_cast<uint32_t>(n);
                     data = false;
                 } else if (n == 20 && hashes160 && key_slots_left > 0) {
                     --key_slots_left; // a key named by its hash: shares the allowance of the executed pk_h locks
