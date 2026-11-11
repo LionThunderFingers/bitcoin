@@ -895,6 +895,82 @@ BOOST_AUTO_TEST_CASE(accounting_untaken_opcode_bytes_are_budgeted)
     }
 }
 
+BOOST_AUTO_TEST_CASE(accounting_static_ranges_do_not_spend_the_untaken_budgets)
+{
+    // The budgets for code that never ran are per input, and an OP_FALSE OP_IF envelope is as large as the
+    // script likes. Its bytes are counted by the static rule already, so they must not spend those budgets:
+    // otherwise an envelope exhausts them and the honest untaken branch beside it, whose bytes no rule has
+    // counted, is charged in full for the privilege.
+    auto charge = [&](const CScript& dead, const CScript& honest) {
+        CScript script;
+        if (!dead.empty()) {
+            script << OP_FALSE << OP_IF << Bytes(200, 7);
+            script.insert(script.end(), dead.begin(), dead.end());
+            script << OP_ENDIF;
+        }
+        script << OP_IF;
+        script.insert(script.end(), honest.begin(), honest.end());
+        script << OP_ENDIF << Key(1) << OP_CHECKSIG;
+        const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
+        // Without an envelope this accounting covers the static count. With one it falls exactly two bytes
+        // short: the static envelope range includes the OP_FALSE OP_IF that opens it, and those two bytes
+        // are flow control that ran, which this accounting never calls data.
+        if (dead.empty()) {
+            BOOST_CHECK_GE(c.extra.total, c.static_counted);
+        } else {
+            BOOST_CHECK_GE(c.extra.total + 2, c.static_counted);
+        }
+        return c;
+    };
+    auto repeat = [&](size_t n, const CScript& unit) {
+        CScript out;
+        for (size_t i = 0; i < n; ++i) out.insert(out.end(), unit.begin(), unit.end());
+        return out;
+    };
+
+    // UNTAKEN_OPCODE_BUDGET: 80 no-ops in the dead region, 90 in the honest branch. Ten of the honest
+    // ninety are over the budget whether the envelope is there or not.
+    {
+        const CScript nop = CScript() << OP_NOP;
+        const auto alone = charge(CScript(), repeat(90, nop));
+        BOOST_CHECK_EQUAL(alone.extra.bytes, 90U - ExecutedDataTracer::UNTAKEN_OPCODE_BUDGET);
+        BOOST_CHECK_EQUAL(charge(repeat(80, nop), repeat(90, nop)).extra.bytes, alone.extra.bytes);
+    }
+    // UNTAKEN_NUMBER_BUDGET: three 5-byte numbers in the dead region, four in the honest branch.
+    {
+        auto numbers = [&](size_t n, unsigned char seed) {
+            CScript out;
+            for (size_t i = 0; i < n; ++i) out << Bytes(5, static_cast<unsigned char>(seed + i));
+            return out;
+        };
+        const auto alone = charge(CScript(), numbers(4, 1));
+        BOOST_CHECK_EQUAL(alone.extra.bytes, 6U); // three are free, the fourth is charged with its push
+        BOOST_CHECK_EQUAL(charge(numbers(3, 40), numbers(4, 1)).extra.bytes, alone.extra.bytes);
+    }
+    // The ten slots for keys named by their hash: ten pk_h in the dead region, two in the honest branch.
+    {
+        auto hashes = [&](size_t n, unsigned char seed) {
+            CScript out;
+            for (size_t i = 0; i < n; ++i) out << OP_HASH160 << Bytes(20, static_cast<unsigned char>(seed + i)) << OP_EQUALVERIFY;
+            return out;
+        };
+        const auto alone = charge(CScript(), hashes(2, 1));
+        BOOST_CHECK_EQUAL(alone.extra.bytes, 0U);
+        BOOST_CHECK_EQUAL(charge(hashes(10, 40), hashes(2, 1)).extra.bytes, alone.extra.bytes);
+    }
+    // And the three hash-lock slots: three 32-byte digests in the dead region, one in the honest branch.
+    {
+        auto digests = [&](size_t n, unsigned char seed) {
+            CScript out;
+            for (size_t i = 0; i < n; ++i) out << OP_SHA256 << Bytes(32, static_cast<unsigned char>(seed + i)) << OP_EQUALVERIFY;
+            return out;
+        };
+        const auto alone = charge(CScript(), digests(1, 1));
+        BOOST_CHECK_EQUAL(alone.extra.bytes, 0U);
+        BOOST_CHECK_EQUAL(charge(digests(3, 40), digests(1, 1)).extra.bytes, alone.extra.bytes);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(accounting_not_followed_is_charged_conservatively)
 {
     // A preimage and a signature: the signature-shaped item is free, the preimage is data.

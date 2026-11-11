@@ -1131,6 +1131,14 @@ ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_scr
             if (std::binary_search(run.executed.begin(), run.executed.end(), static_cast<uint32_t>(op.begin))) continue;
             const bool broken{op.opcode == OP_INVALIDOPCODE};
             const uint64_t bytes{op.end - op.begin};
+            // A byte inside a range the static rules counted is paid for by that rule alone, so it may not
+            // spend the budgets an honest untaken branch draws on either. The dead region of an envelope is
+            // as large as the script likes: letting it exhaust them would leave the honest branch, whose
+            // bytes no rule has counted, charged in full for what the envelope already paid.
+            if (counted_by_static(static_cast<uint32_t>(r), static_cast<uint32_t>(op.begin))) {
+                total += bytes;
+                continue;
+            }
             if (!broken && (op.opcode > OP_PUSHDATA4 || op.data.empty())) {
                 // Not a push, or an empty one. The opcodes of a branch that never ran are not free: a run of them
                 // names a byte each. Flow control is structure, not payload. An honest branch fits the allowance.
@@ -1141,7 +1149,7 @@ ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_scr
                     continue;
                 }
                 total += bytes;
-                if (!counted_by_static(static_cast<uint32_t>(r), static_cast<uint32_t>(op.begin))) outside += bytes;
+                outside += bytes;
                 continue;
             }
             bool data{true};
@@ -1169,7 +1177,6 @@ ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_scr
             }
             if (!data) continue;
             total += bytes;
-            if (counted_by_static(static_cast<uint32_t>(r), static_cast<uint32_t>(op.begin))) continue;
             outside += bytes;
         }
     }
