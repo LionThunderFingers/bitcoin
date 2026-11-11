@@ -717,6 +717,39 @@ BOOST_AUTO_TEST_CASE(small_credit_budget_is_bounded)
     BOOST_CHECK_EQUAL(t.ledger.TotalDataBytes(), 40U * 4 - ExecutedDataTracer::SMALL_CREDIT_BUDGET);
 }
 
+BOOST_AUTO_TEST_CASE(nop_between_key_and_checksig_is_still_a_key)
+{
+    // An x-only push is a key only because a signature check opcode claims it, and an opcode that leaves
+    // the stack as it found it does not stop it doing so. The static counting of unproven keys looks through
+    // those no-ops (IsStackNeutralNop in script/script.cpp), so the tracer must too, or a key is charged as
+    // data on top of the budget that already owns it.
+    // The signature is empty, so the check fails without NULLFAIL and the key earns no credit of its own:
+    // what keeps it out of the data count is its shape alone.
+    for (const int nops : {0, 1, 3}) {
+        CScript script = CScript() << XKey(1);
+        for (int i = 0; i < nops; ++i) script << OP_NOP;
+        script << OP_CHECKSIG << OP_NOT;
+        const auto t = TraceTap(script, {{}});
+        REQUIRE_TRACED(t);
+        const size_t key{FindSource(t.ledger, ExecutedDataTracer::SourceKind::SCRIPT_PUSH, 32)};
+        BOOST_CHECK(t.ledger.IsKeyShaped(key));
+        BOOST_CHECK_EQUAL(t.ledger.credited[key], 0U);
+        BOOST_CHECK_EQUAL(t.ledger.TotalDataBytes(), 0U);
+        BOOST_CHECK_EQUAL(t.ledger.TotalDataBytes(/*exclude_key_shaped=*/false), 32U);
+    }
+    // A push of 32 bytes that no signature check claims is data, no-ops or not.
+    for (const int nops : {0, 2}) {
+        CScript script = CScript() << XKey(1);
+        for (int i = 0; i < nops; ++i) script << OP_NOP;
+        script << OP_DROP << OP_1;
+        const auto t = TraceTap(script, {});
+        REQUIRE_TRACED(t);
+        const size_t key{FindSource(t.ledger, ExecutedDataTracer::SourceKind::SCRIPT_PUSH, 32)};
+        BOOST_CHECK(!t.ledger.IsKeyShaped(key));
+        BOOST_CHECK_EQUAL(t.ledger.TotalDataBytes(), 32U);
+    }
+}
+
 // ---- the charge one input gets, with the static rules and this accounting sharing one ledger ------
 
 BOOST_AUTO_TEST_CASE(accounting_tail_garbage_is_charged_with_its_push)
@@ -807,6 +840,31 @@ BOOST_AUTO_TEST_CASE(accounting_untaken_keys_and_numbers_are_free)
     const CScript script = CScript() << OP_IF << Key(2) << XKey(3) << OP_CHECKSIG << Bytes(5, 1) << OP_DROP << OP_ENDIF << Key(1) << OP_CHECKSIG;
     const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
     BOOST_CHECK_EQUAL(c.extra.bytes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(accounting_nop_between_untaken_key_and_checksig_is_not_charged_twice)
+{
+    // The same lockstep in code that never ran: the static rules count the x-only push under the unproven
+    // key budget because a checksig claims it across the no-op, so this accounting must not charge it again.
+    // OP_CHECKSEQUENCEVERIFY (OP_NOP3) is one of those no-ops: it reads the top of the stack and leaves it.
+    const CScript plain = CScript() << OP_IF << XKey(2) << OP_CHECKSIG << OP_ENDIF << Key(1) << OP_CHECKSIG;
+    const auto base = ChargeSpend(CScript(), Wsh(plain), Wit({Sig(), {}}, plain));
+    BOOST_CHECK_EQUAL(base.extra.bytes, 0U);
+    BOOST_CHECK_GE(base.extra.total, base.static_counted);
+
+    for (const opcodetype nop : {OP_NOP, OP_CHECKSEQUENCEVERIFY, OP_CHECKLOCKTIMEVERIFY, OP_NOP10}) {
+        const CScript script = CScript() << OP_IF << XKey(2) << nop << OP_CHECKSIG << OP_ENDIF << Key(1) << OP_CHECKSIG;
+        const auto c = ChargeSpend(CScript(), Wsh(script), Wit({Sig(), {}}, script));
+        // At most the no-op's own byte more than the shape without it, and that byte is inside the
+        // untaken opcode budget here, so in fact nothing.
+        BOOST_CHECK_LE(c.extra.bytes, base.extra.bytes + 1U);
+        BOOST_CHECK_EQUAL(c.extra.bytes, 0U);
+        BOOST_CHECK_GE(c.extra.total, c.static_counted);
+    }
+
+    // An opcode that is not stack neutral does hide the key, and then it is data in full with its push.
+    const CScript hidden = CScript() << OP_IF << XKey(2) << OP_DUP << OP_CHECKSIG << OP_ENDIF << Key(1) << OP_CHECKSIG;
+    BOOST_CHECK_EQUAL(ChargeSpend(CScript(), Wsh(hidden), Wit({Sig(), {}}, hidden)).extra.bytes, 33U);
 }
 
 BOOST_AUTO_TEST_CASE(accounting_untaken_small_numbers_are_budgeted)

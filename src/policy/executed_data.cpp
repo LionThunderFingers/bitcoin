@@ -57,6 +57,17 @@ bool DecodeNum(const valtype& v, int64_t& out)
 
 uint32_t Cap(uint32_t len, uint32_t cap) { return std::min(len, cap); }
 
+//! Mirror of IsStackNeutralNop in script/script.cpp, which the static counting of unproven keys uses to
+//! carry a key across the opcodes that leave the stack as they found it. The two must stay in lockstep:
+//! where the static rules see a key and this does not, a key is charged as data on top of the budget that
+//! already owns it. It is wider than IsNoOp on purpose, since OP_CHECKLOCKTIMEVERIFY (OP_NOP2) and
+//! OP_CHECKSEQUENCEVERIFY (OP_NOP3) read the top of the stack but leave it there. Every opcode it takes is
+//! a single byte, so a raw script byte can be tested against it.
+bool IsStackNeutralNop(unsigned int opcode)
+{
+    return opcode == OP_NOP || (opcode >= OP_NOP1 && opcode <= OP_NOP10);
+}
+
 bool IsInitialKind(ExecutedDataTracer::SourceKind k)
 {
     return k == ExecutedDataTracer::SourceKind::SCRIPTSIG_PUSH || k == ExecutedDataTracer::SourceKind::WITNESS_ITEM;
@@ -108,8 +119,11 @@ bool ExecutedDataTracer::Ledger::IsKeyShaped(size_t s) const
     if (src.len == 33 || src.len == 65) return true;
     if (src.len != 32) return false;
     const valtype& script{runs.at(src.run).script};
-    if (src.end >= script.size()) return false;
-    const unsigned char next{script[src.end]};
+    // src.end is an opcode boundary, and every stack-neutral no-op is one byte, so this walks opcodes.
+    size_t at{src.end};
+    while (at < script.size() && IsStackNeutralNop(script[at])) ++at;
+    if (at >= script.size()) return false;
+    const unsigned char next{script[at]};
     return next == OP_CHECKSIG || next == OP_CHECKSIGVERIFY || next == OP_CHECKSIGADD;
 }
 
@@ -1132,7 +1146,11 @@ ExecutedDataCharge ExecutedDataBytes(const CTxIn& txin, const CScript& spent_scr
             }
             bool data{true};
             if (!broken) {
-                const opcodetype next{i + 1 < ops.size() ? ops[i + 1].opcode : OP_INVALIDOPCODE};
+                // As on the executed side, a stack-neutral no-op between a key and the opcode that spends
+                // it does not hide the key: the static counting looks through the same ones.
+                size_t j{i + 1};
+                while (j < ops.size() && IsStackNeutralNop(ops[j].opcode)) ++j;
+                const opcodetype next{j < ops.size() ? ops[j].opcode : OP_INVALIDOPCODE};
                 const size_t n{op.data.size()};
                 if (n == 33 || n == 65 || (n == 32 && (next == OP_CHECKSIG || next == OP_CHECKSIGVERIFY || next == OP_CHECKSIGADD))) {
                     data = false; // a key: the unproven-key budget owns it
