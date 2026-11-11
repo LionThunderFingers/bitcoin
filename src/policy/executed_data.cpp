@@ -145,7 +145,7 @@ ExecutedDataTracer::Ledger ExecutedDataTracer::Finish(uint32_t lock_allowance) c
 
     // Group the live locks by their witness-side source: a source credited by several locks counts once.
     struct Group {
-        std::vector<uint32_t> constants;
+        BitSet constants;
         bool all_true{true};
         bool key_hash{true};
     };
@@ -153,9 +153,9 @@ ExecutedDataTracer::Ledger ExecutedDataTracer::Finish(uint32_t lock_allowance) c
     m_live.ForEach([&](size_t r) {
         const LockRecord& rec{m_records[r]};
         Group& g{groups[rec.src]};
-        for (uint32_t c : rec.constants) {
-            if (std::find(g.constants.begin(), g.constants.end(), c) == g.constants.end()) g.constants.push_back(c);
-        }
+        // A set union, so merging a record costs the group's size and not the group's size per constant:
+        // a script may lock one value against one accumulated constant thousands of times.
+        g.constants.Or(rec.constants);
         g.all_true = g.all_true && rec.true_result;
         g.key_hash = g.key_hash && rec.key_hash;
     });
@@ -166,30 +166,32 @@ ExecutedDataTracer::Ledger ExecutedDataTracer::Finish(uint32_t lock_allowance) c
     for (const auto& [s, g] : groups) {
         if (m_sources[s].code) continue;
         bool tiny{m_sources[s].len <= 4};
-        for (uint32_t c : g.constants) tiny = tiny && m_sources[c].len <= 4;
+        g.constants.ForEach([&](size_t c) { tiny = tiny && m_sources[c].len <= 4; });
         if (tiny) {
             small.emplace_back(s, m_sources[s].len);
-            for (uint32_t c : g.constants) small.emplace_back(c, m_sources[c].len);
+            g.constants.ForEach([&](size_t c) { small.emplace_back(static_cast<uint32_t>(c), m_sources[c].len); });
             continue;
         }
         if (g.all_true && m_verified[s]) {
             // The value is a key that really signed: what it was compared with is its own hash.
-            for (uint32_t c : g.constants) grant(c, LOCK_CREDIT_CAP);
+            g.constants.ForEach([&](size_t c) { grant(static_cast<uint32_t>(c), LOCK_CREDIT_CAP); });
             continue;
         }
-        if (g.key_hash && std::all_of(g.constants.begin(), g.constants.end(), [&](uint32_t c) { return m_sources[c].len == 20; })) {
+        bool all_20{true};
+        g.constants.ForEach([&](size_t c) { all_20 = all_20 && m_sources[c].len == 20; });
+        if (g.key_hash && all_20) {
             key_locks.push_back(s);
             continue;
         }
         uint32_t value{Cap(m_sources[s].len, LOCK_CREDIT_CAP)};
-        for (uint32_t c : g.constants) value += Cap(m_sources[c].len, LOCK_CREDIT_CAP);
+        g.constants.ForEach([&](size_t c) { value += Cap(m_sources[c].len, LOCK_CREDIT_CAP); });
         ranked.emplace_back(value, s);
     }
     // Keys named by their hash have an allowance of their own, in source order, which is the same set of
     // sources whatever order the script ran in.
     for (size_t i = 0; i < key_locks.size() && i < KEY_LOCK_ALLOWANCE; ++i) {
         grant(key_locks[i], m_sources[key_locks[i]].len);
-        for (uint32_t c : groups[key_locks[i]].constants) grant(c, LOCK_CREDIT_CAP);
+        groups[key_locks[i]].constants.ForEach([&](size_t c) { grant(static_cast<uint32_t>(c), LOCK_CREDIT_CAP); });
     }
     l.key_lock_slots_left = KEY_LOCK_ALLOWANCE - static_cast<uint32_t>(std::min<size_t>(key_locks.size(), KEY_LOCK_ALLOWANCE));
     // The largest credits win, so the outcome does not depend on the order the locks ran in.
@@ -197,7 +199,7 @@ ExecutedDataTracer::Ledger ExecutedDataTracer::Finish(uint32_t lock_allowance) c
     for (size_t i = 0; i < ranked.size() && i < lock_allowance; ++i) {
         const uint32_t s{ranked[i].second};
         grant(s, LOCK_CREDIT_CAP);
-        for (uint32_t c : groups[s].constants) grant(c, LOCK_CREDIT_CAP);
+        groups[s].constants.ForEach([&](size_t c) { grant(static_cast<uint32_t>(c), LOCK_CREDIT_CAP); });
         ++l.lock_slots_used;
     }
     l.lock_slots_left = lock_allowance - l.lock_slots_used;
@@ -537,7 +539,7 @@ void ExecutedDataTracer::Equality(bool numeric, bool verify, const Real& stack)
         const Elem& other{a_const ? b : a};
         LockRecord rec;
         rec.src = other.src;
-        konst.content.ForEach([&](size_t s) { rec.constants.push_back(static_cast<uint32_t>(s)); });
+        rec.constants = konst.content;
         // The real result is on the stack when the comparison does not verify; otherwise it held.
         rec.key_hash = other.key_hash;
         rec.true_result = verify || (!stack.empty() && stack.back().size() == 1 && stack.back()[0] == 1);

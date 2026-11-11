@@ -21,6 +21,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -157,6 +158,23 @@ Charged ChargeSpend(const CScript& script_sig, const CScript& spk, const CScript
     trace.ledger = t.ledger;
     return {dcb.second, ExecutedDataBytes(txin, spk, traced ? &trace : nullptr, ranges, dcb.second)};
 }
+//! <c> (<c> ADD)* then 2DUP EQUALVERIFY, repeated: one constant made of many pushes, and many locks on it.
+//! The witness value the locks compare with is returned in value.
+CScript ManyConstantLocks(size_t constants, size_t locks, valtype& value)
+{
+    const valtype unit{0x11}; // 17: the smallest one-byte push that is minimal as a push
+    CScript script;
+    script << unit;
+    int64_t sum{17};
+    for (size_t i = 1; i < constants; ++i) {
+        script << unit << OP_ADD;
+        sum += 17;
+    }
+    for (size_t i = 0; i < locks; ++i) script << OP_2DUP << OP_EQUALVERIFY;
+    value = CScriptNum(sum).getvch();
+    return script;
+}
+
 CScriptWitness Wit(std::vector<valtype> items, const CScript& script)
 {
     CScriptWitness w;
@@ -387,6 +405,45 @@ BOOST_AUTO_TEST_CASE(same_source_in_several_locks_counts_once)
     REQUIRE_TRACED(t);
     BOOST_CHECK_EQUAL(t.ledger.TotalDataBytes(), 0U);
     BOOST_CHECK_EQUAL(t.ledger.lock_slots_used, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(many_locks_sharing_many_constants_dedup_is_cheap)
+{
+    // The worst case for merging the constants of the lock records of one source: a constant accumulated from
+    // hundreds of pushes, compared with the same witness value again and again, so every record carries every
+    // constant. A P2WSH script is held down by the 201 opcode limit; a tapscript has no such limit, so a
+    // script of a few thousand bytes can hold thousands of records each naming thousands of constants.
+    auto measure = [&](bool tap, size_t constants, size_t locks) {
+        valtype value;
+        const CScript script{ManyConstantLocks(constants, locks, value)};
+        const auto start{std::chrono::steady_clock::now()};
+        const Traced t{tap ? TraceTap(script, {value}) : TraceWsh(script, {value})};
+        const auto ms{std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()};
+        REQUIRE_TRACED(t);
+        BOOST_TEST_MESSAGE("shape tap=" << tap << " constants=" << constants << " locks=" << locks
+                                        << " script=" << script.size() << " sources=" << t.ledger.sources.size()
+                                        << " total=" << t.ledger.TotalDataBytes()
+                                        << " lock_slots_used=" << t.ledger.lock_slots_used
+                                        << " small_credit_used=" << t.ledger.small_credit_used
+                                        << " ms=" << ms);
+        BOOST_CHECK_LT(ms, 2000); // a guard against a quadratic creeping back in, loose enough for a slow machine
+        return t.ledger;
+    };
+    // A P2WSH shape: 133 OP_ADDs and 33 locks fill the 201 opcode limit. 134 one-byte constants and a
+    // two-byte witness value, of which the small-value budget credits 64 bytes.
+    const Ledger wsh{measure(false, 134, 33)};
+    BOOST_CHECK_EQUAL(wsh.sources.size(), 135U);
+    BOOST_CHECK_EQUAL(wsh.TotalDataBytes(), 134U + 2U - ExecutedDataTracer::SMALL_CREDIT_BUDGET);
+    BOOST_CHECK_EQUAL(wsh.lock_slots_used, 0U);
+    BOOST_CHECK_EQUAL(wsh.small_credit_used, ExecutedDataTracer::SMALL_CREDIT_BUDGET);
+
+    // The tapscript shape, 9999 bytes: 1667 records of 2222 constants each. Same accounting, and the
+    // merge must not cost a scan of the group per constant of every record.
+    const Ledger tap{measure(true, 2222, 1667)};
+    BOOST_CHECK_EQUAL(tap.sources.size(), 2223U);
+    BOOST_CHECK_EQUAL(tap.TotalDataBytes(), 2222U + 3U - ExecutedDataTracer::SMALL_CREDIT_BUDGET);
+    BOOST_CHECK_EQUAL(tap.lock_slots_used, 0U);
+    BOOST_CHECK_EQUAL(tap.small_credit_used, ExecutedDataTracer::SMALL_CREDIT_BUDGET);
 }
 
 BOOST_AUTO_TEST_CASE(small_lock_is_exempt)

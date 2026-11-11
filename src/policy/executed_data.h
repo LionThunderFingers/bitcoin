@@ -186,10 +186,10 @@ private:
     };
 
     struct LockRecord {
-        uint32_t src;                   //!< the single witness-side source
-        std::vector<uint32_t> constants; //!< sources of the constant side
-        bool true_result;               //!< the comparison held
-        bool key_hash;                  //!< the witness side is HASH160 of a key-sized source
+        uint32_t src;        //!< the single witness-side source
+        BitSet constants;    //!< sources of the constant side
+        bool true_result;    //!< the comparison held
+        bool key_hash;       //!< the witness side is HASH160 of a key-sized source
     };
 
     using Stack = std::vector<Elem>;
