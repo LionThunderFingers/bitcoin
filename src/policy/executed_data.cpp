@@ -454,6 +454,12 @@ void ExecutedDataTracer::AfterOp(const Real& stack, const Real& altstack)
         if (m_stack.size() != stack.size() || m_alt.size() != altstack.size()) {
             throw ModelError{"depth mismatch after " + GetOpName(m_op)};
         }
+        // An opcode the interpreter dispatched without executing it is one of OP_IF, OP_NOTIF, OP_ELSE and
+        // OP_ENDIF: the only ones its `fExec || (OP_IF <= opcode && opcode <= OP_ENDIF)` gate lets through,
+        // and none of them reads or writes either stack when it does not run. The shadow was not applied
+        // either, so both sides are exactly what the last check already compared. Fingerprinting the window
+        // again would make an untaken branch cost the window per opcode; EndRun checks the whole stack.
+        if (!m_exec) return;
         Verify(m_stack, stack, m_window, GetOpName(m_op).c_str());
         if (m_roll_slot < stack.size() && m_roll_slot < m_stack.size()) {
             if (m_stack[m_roll_slot].len != stack[m_roll_slot].size() || m_stack[m_roll_slot].hash != HashBytes(stack[m_roll_slot])) {

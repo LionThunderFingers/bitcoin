@@ -1172,6 +1172,47 @@ BOOST_AUTO_TEST_CASE(accounting_does_not_depend_on_the_input_cache)
         }
     }
 }
+
+BOOST_AUTO_TEST_CASE(untaken_flow_ops_do_not_change_the_charge)
+{
+    // A long nest of untaken conditionals over a deep stack of large items. An opcode that did not run
+    // touched neither stack, so there is nothing for the tracer to check after it, and fingerprinting the
+    // window again would cost the window for every opcode of an untaken branch.
+    auto measure = [&](bool tap, size_t nest) {
+        std::vector<valtype> items;
+        for (size_t i = 0; i < 10; ++i) items.push_back(Bytes(520, static_cast<unsigned char>(i)));
+        CScript script = CScript() << OP_0 << OP_IF;
+        for (size_t i = 0; i < nest; ++i) script << OP_IF << OP_ENDIF;
+        script << OP_ENDIF;
+        const auto start{std::chrono::steady_clock::now()};
+        // Tapscript bans OP_IF while the reduced data rules are in force, so that shape is tested as it
+        // will be once they expire, the way accounting_tapscript_untaken_branch_with_reduced_data_off is.
+        const Traced t{tap ? TraceTap(script, items, FLAGS & ~REDUCED_DATA_VERIFY_FLAGS) : TraceWsh(script, items)};
+        const auto ms{std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()};
+        REQUIRE_TRACED(t);
+        InputTrace trace;
+        trace.status = InputTrace::Status::TRACED;
+        trace.ledger = t.ledger;
+        const auto c = ExecutedDataBytes(CTxIn{}, CScript(), &trace, DatacarrierRanges{}, 0);
+        BOOST_TEST_MESSAGE("flow tap=" << tap << " nest=" << nest << " script=" << script.size()
+                                        << " total=" << t.ledger.TotalDataBytes() << " bytes=" << c.bytes
+                                        << " ms=" << ms);
+        BOOST_CHECK_LT(ms, 2000);
+        return std::pair<uint64_t, uint64_t>{t.ledger.TotalDataBytes(), c.bytes};
+    };
+    // P2WSH: 99 nested pairs plus the outer conditional fill the 201 opcode limit.
+    const auto wsh{measure(false, 99)};
+    // Tapscript has no opcode limit, so the nest is as long as the leaf is.
+    const auto tap{measure(true, 4998)};
+    // Ten witness items of 520 bytes that nothing used. The top one is read as the result of the run, which
+    // a raw value needs one byte for. The untaken conditionals are flow control and are charged nothing,
+    // however many of them there are.
+    BOOST_CHECK_EQUAL(wsh.first, 10U * 520U - 1U);
+    BOOST_CHECK_EQUAL(wsh.second, 10U * 520U - 1U);
+    BOOST_CHECK_EQUAL(tap.first, wsh.first);
+    BOOST_CHECK_EQUAL(tap.second, wsh.second);
+}
+
 // ---- the model must hold for every script -----------------------------------------------------
 
 BOOST_AUTO_TEST_CASE(random_scripts_never_break_the_model)
