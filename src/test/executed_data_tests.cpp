@@ -426,7 +426,9 @@ BOOST_AUTO_TEST_CASE(many_locks_sharing_many_constants_dedup_is_cheap)
                                         << " lock_slots_used=" << t.ledger.lock_slots_used
                                         << " small_credit_used=" << t.ledger.small_credit_used
                                         << " ms=" << ms);
-        BOOST_CHECK_LT(ms, 2000); // a guard against a quadratic creeping back in, loose enough for a slow machine
+        // The timing is a coarse guard against a quadratic creeping back in, loose enough for a slow machine.
+        // The pinned ledger values checked by the caller are the real assertion.
+        BOOST_CHECK_LT(ms, 2000);
         return t.ledger;
     };
     // A P2WSH shape: 133 OP_ADDs and 33 locks fill the 201 opcode limit. 134 one-byte constants and a
@@ -1197,6 +1199,7 @@ BOOST_AUTO_TEST_CASE(untaken_flow_ops_do_not_change_the_charge)
         BOOST_TEST_MESSAGE("flow tap=" << tap << " nest=" << nest << " script=" << script.size()
                                         << " total=" << t.ledger.TotalDataBytes() << " bytes=" << c.bytes
                                         << " ms=" << ms);
+        // Coarse guard only, as above: the caller compares the charge across nest depths.
         BOOST_CHECK_LT(ms, 2000);
         return std::pair<uint64_t, uint64_t>{t.ledger.TotalDataBytes(), c.bytes};
     };

@@ -277,7 +277,8 @@ struct ExecutedDataCharge {
     //! Data bytes not already counted by the static rules: the second member of DatacarrierBytes.
     uint64_t bytes{0};
     //! All the bytes this accounting calls data, including those inside ranges the static rules counted.
-    //! At least the static count for every shape the static rules recognise (tested).
+    //! Tracks the static count for the shapes the static rules recognise, but is not guaranteed to reach it:
+    //! an OP_FALSE OP_IF envelope, for one, is counted two bytes lower here.
     uint64_t total{0};
     //! The tracer's model broke. The bytes are then the conservative charge, and the caller rejects
     //! with txn-datacarrier-untraceable unless that is ignored.
