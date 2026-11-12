@@ -771,6 +771,10 @@ private:
     // only invoke this on transactions that have otherwise passed policy checks.
     bool PolicyScriptChecks(const ATMPArgs& args, Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
+    // Re-price the data bytes that only the post-script recount finds and re-check the per-tx fee
+    // rules that use the transaction's virtual size. Runs after the scripts, from PolicyScriptChecks.
+    bool RepriceDatacarrierRecount(const ATMPArgs& args, Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+
     // Re-run the script checks, using consensus flags, and try to cache the
     // result in the scriptcache. This should be done after
     // PolicyScriptChecks(). This requires that all inputs either be in our
@@ -1568,7 +1572,7 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     // PreChecks counted the unproven pubkeys of each input from the script alone, before any script ran,
     // and a signature-check opcode in code that never runs, or that runs and fails, fools that count.
     // Now that the scripts have run, count again from the keys a signature really verified against.
-    // The recount can only add to what PreChecks charged. datacarriercost pricing is not redone.
+    // The recount can only add to what PreChecks charged.
     // Recording keeps CheckInputScripts out of the script execution cache, so every input ran and has
     // its set, and an input that verified no key is recounted with an empty one. Only a result without
     // one set per input would be no observation, and the static count would stand.
@@ -1579,6 +1583,57 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
             return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "txn-datacarrier-exceeded");
         }
     }
+
+    // PreChecks priced -datacarriercost from the static count made before the scripts ran. Now that the
+    // recount is known, re-price from it and re-check the per-tx fee rules that use the virtual size.
+    if (!RepriceDatacarrierRecount(args, ws)) return false;
+
+    return true;
+}
+
+// After the scripts have run, the recount above can find data bytes the pre-script static count missed.
+// PreChecks priced -datacarriercost from that static count, so re-price here from the recount and
+// re-check the fee rules that depend on the transaction's virtual size. The recount can only add bytes,
+// so the virtual size only grows and each check can only move from accept to reject. ws.m_vsize is
+// updated so the effective feerate reported for the tx, and summed for a package, reflects the price
+// actually charged. The staged mempool entry's weight is const and left unchanged, so the recount is
+// enforced at admission only: the bytes it adds are priced here and in the package total, but the
+// entry's own stored size, and the topology checks that read it before the scripts (ancestor/descendant
+// and TRUC vsize, the CPFP carve-out, and the package RBF rules in PackageMempoolChecks), stay on the
+// pre-script count. The size they understate is bounded by the datacarrier bytes the recount adds, at
+// most -datacarriersize (default 83) priced at the per-byte weight -datacarriercost sets, and is larger
+// when -datacarriersize is raised or the limit is in ignore_rejects. Those are not -datacarriercost and
+// the understatement is small against their far larger limits. Single-tx RBF feerate rules are
+// re-checked by the caller, where the conflict set is in hand. Returns false, state filled,
+// on a new fee failure.
+bool MemPoolAccept::RepriceDatacarrierRecount(const ATMPArgs& args, Workspace& ws)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_pool.cs);
+    const CTransaction& tx = *ws.m_ptx;
+    TxValidationState& state = ws.m_state;
+
+    // Same observation guard the limit recount uses: a full set per input, or nothing.
+    if (!m_pool.m_opts.datacarrier_fullcount || ws.m_verified_keys.size() != tx.vin.size()) return true;
+
+    const int32_t new_extra_weight{CalculateExtraTxWeight(tx, m_view, ::g_weight_per_data_byte, &ws.m_verified_keys)};
+    if (new_extra_weight <= ws.m_tx_handle->GetExtraWeight()) return true; // recount priced nothing new
+
+    const int64_t new_vsize{GetVirtualTransactionSize(SaturatingAdd(ws.m_tx_handle->GetTxWeight(), new_extra_weight), ws.m_tx_handle->GetSigOpCost(), ::nBytesPerSigOp)};
+    if (new_vsize <= ws.m_vsize) return true;
+    ws.m_vsize = new_vsize;
+
+    // Mirror the per-tx min relay feerate check in PreChecks (not bypassable by package feerates, TRUC
+    // excepted), re-evaluated at the recount virtual size.
+    if ((tx.version != TRUC_VERSION || m_pool.m_opts.truc_policy != TRUCPolicy::Enforce) &&
+        ws.m_modified_fees < m_pool.m_opts.min_relay_feerate.GetFee(ws.m_vsize) &&
+        !args.m_ignore_rejects.count(rejectmsg_lowfee_relay)) {
+        return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "min relay fee not met",
+                             strprintf("%d < %d", ws.m_modified_fees, m_pool.m_opts.min_relay_feerate.GetFee(ws.m_vsize)));
+    }
+    // Mirror the per-tx mempool min feerate check (skipped for package members, checked by package
+    // feerate later), re-evaluated at the recount virtual size.
+    if (!args.m_package_feerates && !CheckFeeRate(ws.m_vsize, ws.m_modified_fees, state, args.m_ignore_rejects)) return false;
 
     return true;
 }
@@ -1793,6 +1848,28 @@ MempoolAcceptResult MemPoolAccept::AcceptSingleTransaction(const CTransactionRef
     // those checks pass, to mitigate CPU exhaustion denial-of-service attacks.
     if (!PolicyScriptChecks(args, ws)) return MempoolAcceptResult::Failure(ws.m_state);
 
+    // The recount in PolicyScriptChecks may have raised ws.m_vsize above what ReplacementChecks priced
+    // from (it ran before the scripts, on the static count). Re-check the RBF feerate rules at the
+    // recount virtual size. The conflict set and totals are already in hand, so only the pure feerate
+    // predicates re-run; the staged removals are not redone.
+    if (m_subpackage.m_rbf && !args.m_ignore_rejects.count("insufficient fee")) {
+        const CFeeRate newFeeRate(ws.m_modified_fees, ws.m_vsize);
+        if (const auto err_string{PaysMoreThanConflicts(ws.m_iters_conflicting, newFeeRate, ws.m_hash)}) {
+            ws.m_state.Invalid(TxValidationResult::TX_RECONSIDERABLE,
+                               strprintf("insufficient fee%s", ws.m_sibling_eviction ? " (including sibling eviction)" : ""), *err_string);
+            return MempoolAcceptResult::FeeFailure(ws.m_state, CFeeRate(ws.m_modified_fees, ws.m_vsize), single_wtxid);
+        }
+        if (const auto err_string{PaysForRBF(m_subpackage.m_conflicting_fees, ws.m_modified_fees, ws.m_vsize,
+                                             m_pool.m_opts.incremental_relay_feerate, ws.m_hash)}) {
+            ws.m_state.Invalid(TxValidationResult::TX_RECONSIDERABLE,
+                               strprintf("insufficient fee%s", ws.m_sibling_eviction ? " (including sibling eviction)" : ""), *err_string);
+            return MempoolAcceptResult::FeeFailure(ws.m_state, CFeeRate(ws.m_modified_fees, ws.m_vsize), single_wtxid);
+        }
+    }
+    // Keep the subpackage total in step with any recount re-price, so FinalizeSubpackage's logging and
+    // the replacement tracepoint report the size the tx was actually priced and accepted at.
+    m_subpackage.m_total_vsize = ws.m_vsize;
+
     if (!ConsensusScriptChecks(args, ws)) return MempoolAcceptResult::Failure(ws.m_state);
 
     const CFeeRate effective_feerate{ws.m_modified_fees, static_cast<uint32_t>(ws.m_vsize)};
@@ -1924,7 +2001,7 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
         !CheckFeeRate(m_subpackage.m_total_vsize, m_subpackage.m_total_modified_fees, placeholder_state, empty_ignore_rejects)) {
         package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
         return PackageMempoolAcceptResult(package_state, {{workspaces.back().m_ptx->GetWitnessHash(),
-            MempoolAcceptResult::FeeFailure(placeholder_state, CFeeRate(m_subpackage.m_total_modified_fees, m_subpackage.m_total_vsize), all_package_wtxids)}});
+            MempoolAcceptResult::FeeFailure(placeholder_state, package_feerate, all_package_wtxids)}});
     }
 
     // Apply package mempool ancestor/descendant limits. Skip if there is only one transaction,
@@ -1952,6 +2029,11 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
             return PackageMempoolAcceptResult(package_state, std::move(results));
         }
+        // Build each member's test-accept result as its script check passes, so a later member failing
+        // still leaves the earlier members their full results (testmempoolaccept relies on this). The
+        // datacarrier recount can only raise a member's vsize, so the package total is re-checked after
+        // the loop; the per-member package feerate reported here stays on the pre-script value, like the
+        // stored entry size (see RepriceDatacarrierRecount).
         if (args.m_test_accept) {
             const auto effective_feerate = args.m_package_feerates ? ws.m_package_feerate :
                 CFeeRate{ws.m_modified_fees, static_cast<uint32_t>(ws.m_vsize)};
@@ -1962,6 +2044,22 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
                                                          ws.m_vsize, ws.m_base_fees, effective_feerate,
                                                          effective_feerate_wtxids));
         }
+    }
+
+    // The recount may have raised members' vsize above what the pre-script package feerate check used.
+    // Re-total and re-check the package feerate, mirroring that check, before reporting or submitting.
+    // Fees are unchanged; only the total vsize can grow, so this can only move from accept to reject.
+    // (Package RBF rules in PackageMempoolChecks are not redone here; see RepriceDatacarrierRecount.)
+    m_subpackage.m_total_vsize = std::accumulate(workspaces.cbegin(), workspaces.cend(), int64_t{0},
+        [](int64_t sum, auto& ws) { return sum + ws.m_vsize; });
+    TxValidationState repriced_placeholder_state;
+    if (args.m_package_feerates &&
+        (!args.m_ignore_rejects.count("package-fee-too-low")) &&
+        !CheckFeeRate(m_subpackage.m_total_vsize, m_subpackage.m_total_modified_fees, repriced_placeholder_state, empty_ignore_rejects)) {
+        package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+        return PackageMempoolAcceptResult(package_state, {{workspaces.back().m_ptx->GetWitnessHash(),
+            MempoolAcceptResult::FeeFailure(repriced_placeholder_state,
+                CFeeRate(m_subpackage.m_total_modified_fees, m_subpackage.m_total_vsize), all_package_wtxids)}});
     }
 
     if (args.m_test_accept) return PackageMempoolAcceptResult(package_state, std::move(results));

@@ -677,17 +677,25 @@ std::pair<size_t, size_t> DatacarrierBytes(const CTransaction& tx, const CCoinsV
     return ret;
 }
 
-int32_t CalculateExtraTxWeight(const CTransaction& tx, const CCoinsViewCache& view, const unsigned int weight_per_data_byte)
+int32_t CalculateExtraTxWeight(const CTransaction& tx, const CCoinsViewCache& view, const unsigned int weight_per_data_byte, const std::vector<VerifiedKeys>* verified_keys)
 {
     int64_t mod_weight{0};
 
+    // A set per input or none at all. A partial one is not an observation. Matches DatacarrierBytes.
+    if (verified_keys && verified_keys->size() != tx.vin.size()) verified_keys = nullptr;
+
     // Add in any extra weight for data bytes
     if (weight_per_data_byte > 1) {
-        for (const CTxIn& txin : tx.vin) {
+        for (size_t i{0}; i < tx.vin.size(); ++i) {
+            const CTxIn& txin = tx.vin[i];
             const CTxOut &utxo = view.AccessCoin(txin.prevout).out;
             auto[script, consensus_weight_per_byte] = GetScriptForTransactionInput(utxo.scriptPubKey, txin);
             if (weight_per_data_byte > consensus_weight_per_byte) {
-                const auto dcb = script.DatacarrierBytes(0, &txin.scriptWitness, FollowDeadBranches(txin));
+                // Recount from the verified keys only for witness-derived scripts (per-byte weight 1),
+                // where the bypass lives; scriptSig scripts come back at WITNESS_SCALE_FACTOR and keep
+                // the static count. Same rule as DatacarrierBytes.
+                const VerifiedKeys* input_keys{(verified_keys && consensus_weight_per_byte == 1) ? &(*verified_keys)[i] : nullptr};
+                const auto dcb = script.DatacarrierBytes(0, &txin.scriptWitness, FollowDeadBranches(txin), input_keys);
                 mod_weight += int64_t(dcb.first + dcb.second) * (weight_per_data_byte - consensus_weight_per_byte);
             }
         }
