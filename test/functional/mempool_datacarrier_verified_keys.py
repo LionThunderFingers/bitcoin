@@ -108,13 +108,17 @@ def charge_for(unproven_keys):
 
 class VerifiedKeyCreditTest(BitcoinTestFramework):
     def set_test_params(self):
-        self.num_nodes = 6
+        self.num_nodes = 7
         # The cached chain predates the fork, so every block here is mined under the fork's rules.
         self.setup_clean_chain = True
         # Counting is gated on -datacarrierfullcount (default on). Nodes 0 to 4 count and enforce
-        # standardness; node 5 turns it off, so nothing is counted there.
+        # standardness; node 5 turns it off, so nothing is counted there. Node 6 prices the count with a
+        # high -datacarriercost; its -datacarriersize is the default 83 cap, and the priced spends charge
+        # under that, so only pricing, never the limit, can refuse them there.
         defaults = NODE_ARGS + ["-acceptnonstdtxn=0"]
-        self.extra_args = [defaults] + [defaults + [f"-datacarriersize={n}"] for n in LIMITS[1:]] + [NODE_ARGS + ["-datacarrierfullcount=0"]]
+        self.extra_args = ([defaults] + [defaults + [f"-datacarriersize={n}"] for n in LIMITS[1:]]
+                           + [NODE_ARGS + ["-datacarrierfullcount=0"]]
+                           + [defaults + ["-datacarriersize=83", "-datacarriercost=10.0"]])
 
     # ---- building blocks ----
 
@@ -211,6 +215,73 @@ class VerifiedKeyCreditTest(BitcoinTestFramework):
         res = self.accept(self.nodes[5], tx)
         assert res['allowed'], f"{what}: the node without -datacarrierfullcount should not count it: {res}"
         self.log.info(f"  ok  {what}: accepted without -datacarrierfullcount")
+
+    def recount_pricing(self):
+        """-datacarriercost prices the bytes only the recount finds. A decoy whose fee clears the relay
+        floor on the pre-script static count falls below it once the recount is priced in, and is
+        refused for fee (not for the limit, which node 6 sets high enough never to trip)."""
+        cost = self.nodes[6]      # -datacarriercost=10.0, -datacarriersize=83
+        nocount = self.nodes[5]   # -datacarrierfullcount=0: never recounts, prices the base size
+
+        # A 1-of-13 decoy: the static count credits all thirteen keys and charges nothing, so the price is
+        # set from the base size; the recount charges the twelve unproven ones, 66 bytes, which still fits
+        # the 83 byte limit so only the price, not the limit, can refuse it. The output value, not the
+        # size, carries the fee, so the base vsize is the same whatever fee we pick.
+        script, stack = self.decoy_script_stack(13, 1, 'depth')
+        build = lambda fee: self.spend_many([self.p2wsh_spec(script, stack)], fee=fee)
+        base_vsize = self.accept(nocount, build(10_000))['vsize']
+
+        # A fee that pays at or above the min relay feerate (1 sat/vB) on the base size, but not once the
+        # recount is priced in. GetFee(base_vsize) == base_vsize sat, so base_vsize + 300 clears the base
+        # size and fails once the recount raises the size (66 bytes at -datacarriercost=10 adds ~643 vB).
+        fee = base_vsize + 300
+        tx = build(fee)
+        r_cost = self.accept(cost, tx)
+        assert not r_cost['allowed'] and 'min relay fee' in r_cost['reject-reason'], r_cost
+        assert self.accept(nocount, tx)['allowed'], "without the full count the recount never prices it"
+        self.log.info(f"  ok  recount pricing: fee {fee} under the recount price refused for fee (base vsize {base_vsize})")
+
+        # A fee that also covers the recount price is accepted, and the vsize reported for it reflects the
+        # recount, so it is strictly larger than the base size the node without the full count reports.
+        tx_ok = build(base_vsize + 2_000)
+        ok_cost, ok_nocount = self.accept(cost, tx_ok), self.accept(nocount, tx_ok)
+        assert ok_cost['allowed'] and ok_nocount['allowed'], (ok_cost, ok_nocount)
+        assert ok_cost['vsize'] > ok_nocount['vsize'], (ok_cost, ok_nocount)
+        self.log.info(f"  ok  recount pricing: priced vsize {ok_cost['vsize']} exceeds base {ok_nocount['vsize']}")
+
+    def recount_pricing_rbf(self):
+        """RBF rule 6 (a replacement must beat its conflict's feerate) is re-checked at the recount size.
+        A replacement that beats the original's feerate on its base size falls below it once the recount
+        prices in the decoy bytes it carries, so it is refused for fee. The feerates stay well above the
+        min relay floor so this is the RBF rule that fails, not min relay, and well under the 83 byte
+        limit so it is the price, not the limit, that refuses it."""
+        cost = self.nodes[6]
+        nocount = self.nodes[5]
+        existing = {'outpoint': self.fund(script_to_p2wsh_script(CScript([OP_TRUE]))),
+                    'stack': lambda tx, i: [bytes([OP_TRUE])], 'sequence': 0xfffffffd}
+        self.generate(self.wallet, 1, sync_fun=self.sync_blocks)
+
+        # The original pays 4 sat/vB. The replacement adds a 1-of-13 decoy input the recount charges 66
+        # bytes, and pays 6 sat/vB on its base size (beats the original) but about 2.6 sat/vB once the
+        # recount roughly doubles its size (below the original). Measure both base sizes on the node that
+        # never recounts, where the fee is priced on the base size.
+        decoy = self.decoy_spec(13, 1, 'depth')
+        vo = self.accept(nocount, self.spend_many([existing], fee=10_000))['vsize']
+        vr = self.accept(nocount, self.spend_many([existing, decoy], fee=10_000))['vsize']
+        original = self.spend_many([existing], fee=4 * vo)
+        replacement = self.spend_many([existing, decoy], fee=6 * vr)
+
+        cost.sendrawtransaction(original.serialize().hex())
+        assert original.rehash() in cost.getrawmempool()
+        assert_raises_rpc_error(-26, "insufficient fee", cost.sendrawtransaction, replacement.serialize().hex())
+        assert original.rehash() in cost.getrawmempool() and replacement.rehash() not in cost.getrawmempool()
+
+        # Without the full count the same replacement is priced on the base size and replaces the original.
+        nocount.sendrawtransaction(original.serialize().hex())
+        nocount.sendrawtransaction(replacement.serialize().hex())
+        assert replacement.rehash() in nocount.getrawmempool() and original.rehash() not in nocount.getrawmempool()
+        self.log.info(f"  ok  recount pricing (RBF): rule 6 refuses the replacement at the recount size (base vsizes {vo}/{vr})")
+        self.generate(self.wallet, 1, sync_fun=self.sync_blocks)
 
     # ---- the attack family ----
 
@@ -763,6 +834,10 @@ class VerifiedKeyCreditTest(BitcoinTestFramework):
 
         self.log.info("Replace by fee")
         self.replace_by_fee()
+
+        self.log.info("-datacarriercost prices the bytes only the recount finds")
+        self.recount_pricing()
+        self.recount_pricing_rbf()
 
         self.log.info("An operator's bypass leaves no way back in through the script execution cache")
         self.operator_bypass_then_resubmit()

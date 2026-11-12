@@ -60,10 +60,13 @@ CHILD_FEE = 50_000
 
 class VerifiedKeyPackageTest(VerifiedKeyCreditTest):
     def set_test_params(self):
-        self.num_nodes = 2
+        self.num_nodes = 3
         self.setup_clean_chain = True
         defaults = NODE_ARGS + ["-acceptnonstdtxn=0"]
-        self.extra_args = [defaults, defaults + ["-mempooltruc=enforce"]]
+        # Node 2 reaches AcceptMultipleTransactions like node 1, and prices the recount with a high
+        # -datacarriercost; its -datacarriersize is the 83 cap and the priced child charges under it.
+        self.extra_args = [defaults, defaults + ["-mempooltruc=enforce"],
+                           defaults + ["-mempooltruc=enforce", "-datacarriersize=83", "-datacarriercost=10.0"]]
         # value of every output this test created, by (txid, n), for the signature hash. The base class
         # signs for a fixed amount, which does not hold once a parent pays a fee.
         self.values = {}
@@ -185,10 +188,57 @@ class VerifiedKeyPackageTest(VerifiedKeyCreditTest):
         node.disconnect_p2ps()
         self.next_block()
 
+    def package_recount_pricing(self):
+        """-datacarriercost prices the recount on the package total too. A CPFP whose 0-fee parent needs
+        the package pays its way on the base total, but the recount on the child's decoy input raises the
+        total size enough that the package feerate falls below the floor, so the package is refused for
+        fee (not for the limit: the child charges 66 bytes, under the 83 cap). The child alone still clears
+        the min relay feerate at the recount size, so it is the package feerate that fails, not the child's."""
+        cost = self.nodes[2]
+        small_decoy = self.decoy_spec(13, 1, 'depth')
+
+        def make(child_fee):
+            parent = self.spend_ex(self.honest(), small_decoy['spk'], TRUC, 0)
+            child = self.spend_ex(dict(small_decoy, outpoint=COutPoint(int(parent.rehash(), 16), 0)),
+                                  script_to_p2wsh_script(CScript([OP_TRUE])), TRUC, child_fee)
+            return parent, child
+
+        # Probe the recount sizes on the pricing node with a generous fee: the parent's size and the
+        # child's size as priced with the recount in.
+        p0, c0 = make(CHILD_FEE)
+        probe = cost.submitpackage(self.hexes([p0, c0]))
+        assert_equal(probe['package_msg'], "success")
+        parent_vsize = probe['tx-results'][p0.getwtxid()]['vsize']
+        child_recount_vsize = probe['tx-results'][c0.getwtxid()]['vsize']
+        self.next_block()
+
+        # A child fee that pays for the child itself at the recount size (child_fee >= child_recount_vsize,
+        # so the child is not what fails the min relay feerate), but leaves the package total, which also
+        # carries the 0-fee parent's size, below the floor (child_fee < parent_vsize + child_recount_vsize).
+        child_fee = child_recount_vsize + max(1, parent_vsize // 2)
+        parent, child = make(child_fee)
+        self.alone_is_refused_on_fee(cost, parent)
+        res = cost.submitpackage(self.hexes([parent, child]))
+        assert_equal(res['package_msg'], "transaction failed")
+        assert all(REJECT not in r.get('error', '') for r in res['tx-results'].values()), res
+        assert not self.in_pool(cost, parent) and not self.in_pool(cost, child), res
+        self.log.info(f"  ok  package recount pricing: the package feerate refuses it at the recount total "
+                      f"(parent {parent_vsize}, child {child_recount_vsize})")
+        self.next_block()
+
+        # On node 1, at the default -datacarriercost, the small recount bump leaves the package paying, so
+        # the same shape is accepted. That contrast shows the refusal above is the price, not the shape.
+        parent, child = make(child_fee)
+        res = self.nodes[1].submitpackage(self.hexes([parent, child]))
+        assert_equal(res['package_msg'], "success")
+        assert self.in_pool(self.nodes[1], parent) and self.in_pool(self.nodes[1], child), res
+        self.log.info("  ok  package recount pricing: accepted at the default -datacarriercost")
+        self.next_block()
+
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
         self.generate(self.wallet, WARMUP_BLOCKS)
-        node0, node1 = self.nodes
+        node0, node1 = self.nodes[0], self.nodes[1]
 
         self.log.info("Node 0, Knots defaults: version 2 packages are tried transaction by transaction first")
         self.decoy_child(node0, 2, PARENT_FEE, "decoy child of an honest parent", multi=False)
@@ -208,6 +258,9 @@ class VerifiedKeyPackageTest(VerifiedKeyCreditTest):
         self.log.info("Node 1, p2p 1p1c: child first, then its 0-fee parent")
         self.p2p_1p1c(node1, True, "p2p 1p1c, decoy child")
         self.p2p_1p1c(node1, False, "p2p 1p1c, honest control")
+
+        self.log.info("Node 2, -datacarriercost: the recount is priced on the package total")
+        self.package_recount_pricing()
 
 
 if __name__ == '__main__':
