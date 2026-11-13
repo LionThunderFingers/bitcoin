@@ -1554,9 +1554,18 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     const unsigned int scriptVerifyFlags = PolicyScriptVerifyFlags(args.m_ignore_rejects) |
         UnifiedSighashMempoolFlag(m_active_chainstate.m_chainman);
 
+    // The datacarrier recount below runs only when -datacarrierfullcount is on, the limit is enforced,
+    // and the transaction has a witness: only a script taken from the witness is recounted, so without
+    // one the recount equals the count PreChecks already checked. Record the verified keys only then: a
+    // non-null set makes CheckInputScripts skip the script execution cache so every input is run, which
+    // is wasted work when no recount follows.
+    const bool recount{m_pool.m_opts.datacarrier_fullcount &&
+                       !args.m_ignore_rejects.count("txn-datacarrier-exceeded") &&
+                       tx.HasWitness()};
+
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), nullptr, {}, &ws.m_verified_keys)) {
+    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), nullptr, {}, recount ? &ws.m_verified_keys : nullptr)) {
         // Detect a failure due to a missing witness so that p2p code can handle rejection caching appropriately.
         if (!tx.HasWitness() && SpendsNonAnchorWitnessProg(tx, m_view)) {
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
@@ -1572,8 +1581,7 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     // Recording keeps CheckInputScripts out of the script execution cache, so every input ran and has
     // its set, and an input that verified no key is recounted with an empty one. Only a result without
     // one set per input would be no observation, and the static count would stand.
-    if (m_pool.m_opts.datacarrier_fullcount && !args.m_ignore_rejects.count("txn-datacarrier-exceeded") &&
-        ws.m_verified_keys.size() == tx.vin.size()) {
+    if (recount && ws.m_verified_keys.size() == tx.vin.size()) {
         const auto dcb = DatacarrierBytes(tx, m_view, &ws.m_verified_keys);
         if (dcb.first + dcb.second > m_pool.m_opts.max_datacarrier_bytes.value_or(0)) {
             return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "txn-datacarrier-exceeded");
