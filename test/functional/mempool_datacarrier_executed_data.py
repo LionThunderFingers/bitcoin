@@ -109,8 +109,12 @@ def sha256(b):
 
 
 def nz(n):
-    """n random bytes, the first one nonzero."""
-    return bytes([1 + randbytes(1)[0] % 200]) + randbytes(n - 1)
+    """n random bytes, the first one nonzero. A single byte is never one a script push of it would write as an
+    opcode (1 to 16, or 0x81), so pushing it is minimal, as the standard flags require."""
+    first = 1 + randbytes(1)[0] % 200
+    if n == 1 and (first <= 16 or first == 0x81):
+        first += 0x20
+    return bytes([first]) + randbytes(n - 1)
 
 
 def cs(n):
@@ -436,6 +440,28 @@ class ExecutedDataTest(BitcoinTestFramework):
         # Many empty items are free.
         script = CScript([OP_2DROP] * 45 + [pub, OP_CHECKSIG])
         self.check(self.spend(script, lambda tx, i: [self.p2wsh_sig(K, script, tx, i)] + [b'' for _ in range(90)]), 0, "90 empty witness items")
+        # The same push sizes in a branch that does not run, and as a dropped item. Pushes of 0 or 1 byte are numbers, inside
+        # the untaken-number budget, so they are free. A push of n bytes is charged its length and its push opcode (1 byte
+        # up to 75, 2 to 255), so 75 and 76 sit at 76 and 78, and 255 and 256 are over the limit. A P2WSH witness item is
+        # capped at 80 bytes and a tapscript item at 80 by standardness, and a script push at 256 by RDTS, so the sizes
+        # above are P2SH scriptSig items. (A tapscript OP_IF is banned by RDTS, so there is no tapscript untaken row.)
+        def mini(size):
+            # a one-byte push of 1 to 16 or 0x81 is not minimal, and a script that pushes it fails MINIMALDATA
+            return bytes([0x20 + randbytes(1)[0] % 0x50]) + randbytes(size - 1) if size else b''
+        for size in (0, 1, 16, 17, 75, 76, 255, 256):
+            push = mini(size)
+            overhead = 1 if size <= 75 else (2 if size <= 255 else 3)
+            charge = 0 if size <= 1 else size + overhead
+            script = CScript([OP_IF, push, OP_ENDIF, pub, OP_CHECKSIG])
+            self.check(self.spend(script, lambda tx, i: [self.p2wsh_sig(K, script, tx, i), b'']), None if charge > 83 else charge, f"untaken push of {size} bytes, P2WSH")
+            self.check(self.spend_many([self.p2sh(script, lambda tx, i: [self.legacy_sig(K, script, tx, i), b''])]), None if charge > 83 else charge, f"untaken push of {size} bytes, P2SH")
+        drop = CScript([OP_DROP, pub, OP_CHECKSIG])
+        for size in (0, 75, 76):
+            item = mini(size)
+            self.check(self.spend(drop, lambda tx, i: [self.p2wsh_sig(K, drop, tx, i), item]), size, f"dropped witness item of {size} bytes")
+        for size in (0, 1, 16, 17, 75, 76, 255, 256):
+            item = mini(size)
+            self.check(self.spend_many([self.p2sh(drop, lambda tx, i: [self.legacy_sig(K, drop, tx, i), item])]), None if size > 83 else size, f"dropped P2SH scriptSig item of {size} bytes")
         # A redeemScript of 513 bytes is code.
         keys = [self.newkey() for _ in range(15)]
         redeem = CScript([15] + [self.pub(k) for k in keys] + [15, OP_CHECKMULTISIG])
